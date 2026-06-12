@@ -524,31 +524,20 @@ def project_workspace(data: dict[str, pd.DataFrame]) -> None:
     with tabs[1]:
         show_gantt(schedules, tasks)
     with tabs[2]:
-        task_spreadsheet_editor(project_id, tasks)
-        task_entry_form(project_id)
-        edit_task_form(tasks)
-        show_table(tasks, ["task_type", "task_name", "owner", "start_date", "due_date", "status", "progress", "weight", "dependency_ids", "is_critical", "remarks"], 380)
+        task_spreadsheet_editor(project_id, tasks, "Task table - paste from Excel")
     with tabs[3]:
         majors = tasks[tasks["task_type"].eq("Major")]
         fig = px.bar(majors, x="task_name", y="progress", color="status", color_discrete_map=STATUS_COLORS, title="Major Task Weighted Progress") if not majors.empty else None
         if fig:
             fig.update_layout(xaxis_title="", yaxis_title="Progress %", yaxis_range=[0, 100])
             st.plotly_chart(fig, use_container_width=True)
-        show_table(majors, ["task_name", "owner", "due_date", "status", "progress", "weight", "dependency_ids", "remarks"], 330)
+        task_spreadsheet_editor(project_id, majors, "Major task table - paste from Excel", default_task_type="Major")
     with tabs[4]:
         risk_spreadsheet_editor(project_id, risks)
-        risk_entry_form(project_id)
-        edit_risk_form(risks)
-        show_table(risks, ["title", "category", "severity", "probability", "owner", "status", "due_date", "mitigation_plan"], 360)
     with tabs[5]:
         issue_spreadsheet_editor(project_id, issues)
-        issue_entry_form(project_id)
-        edit_issue_form(issues)
-        show_table(issues, ["title", "severity", "owner", "status", "due_date", "resolution_plan"], 360)
     with tabs[6]:
         budget_spreadsheet_editor(project_id, budget)
-        budget_entry_form(project_id)
-        edit_budget_form(budget)
         if not budget.empty:
             fig = px.bar(
                 budget.melt(["cost_code", "category"], value_vars=["budget", "actual", "committed", "forecast"], var_name="type", value_name="amount"),
@@ -559,7 +548,6 @@ def project_workspace(data: dict[str, pd.DataFrame]) -> None:
                 title="Cost Breakdown",
             )
             st.plotly_chart(fig, use_container_width=True)
-        show_table(budget, ["cost_code", "category", "budget", "actual", "committed", "forecast", "owner"], 330)
     with tabs[7]:
         show_upload_section(project_id, docs)
     with tabs[8]:
@@ -718,8 +706,14 @@ def task_entry_form(project_id: int) -> None:
                 refresh()
 
 
-def task_spreadsheet_editor(project_id: int, tasks: pd.DataFrame) -> None:
-    with st.expander("Spreadsheet task editor - paste from Excel", expanded=True):
+def task_spreadsheet_editor(
+    project_id: int,
+    tasks: pd.DataFrame,
+    title: str = "Task table - paste from Excel",
+    default_task_type: str = "Daily",
+) -> None:
+    editor_key = title.lower().replace(" ", "_").replace("-", "_")
+    with st.expander(title, expanded=True):
         columns = ["task_type", "task_name", "owner", "start_date", "due_date", "status", "progress", "weight", "dependency_ids", "is_critical", "remarks"]
         editor = prepare_editor_frame(tasks, columns)
         for col in ["start_date", "due_date"]:
@@ -730,7 +724,7 @@ def task_spreadsheet_editor(project_id: int, tasks: pd.DataFrame) -> None:
             use_container_width=True,
             hide_index=True,
             num_rows="dynamic",
-            key=f"task_sheet_{project_id}",
+            key=f"task_sheet_{project_id}_{editor_key}",
             column_config={
                 **editor_common_config(),
                 "task_type": st.column_config.SelectboxColumn("Task Type", options=["Major", "Daily"]),
@@ -742,7 +736,7 @@ def task_spreadsheet_editor(project_id: int, tasks: pd.DataFrame) -> None:
                 "is_critical": st.column_config.CheckboxColumn("Critical"),
             },
         )
-        if st.button("Save Task Table", type="primary", key=f"save_task_sheet_{project_id}"):
+        if st.button("Save Table", type="primary", key=f"save_task_sheet_{project_id}_{editor_key}"):
             changed = 0
             for _, row in edited.iterrows():
                 record_id = row.get("id")
@@ -754,7 +748,7 @@ def task_spreadsheet_editor(project_id: int, tasks: pd.DataFrame) -> None:
                 if not clean_text(row.get("task_name")) and not clean_text(row.get("owner")):
                     continue
                 fields = {
-                    "task_type": clean_text(row.get("task_type")) or "Daily",
+                    "task_type": clean_text(row.get("task_type")) or default_task_type,
                     "task_name": clean_text(row.get("task_name")),
                     "owner": clean_text(row.get("owner")),
                     "start_date": clean_date(row.get("start_date"), date.today()),
