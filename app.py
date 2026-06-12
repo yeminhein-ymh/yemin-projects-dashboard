@@ -378,7 +378,7 @@ def prepare_editor_frame(frame: pd.DataFrame, columns: list[str]) -> pd.DataFram
 def editor_common_config() -> dict:
     return {
         "_delete": st.column_config.CheckboxColumn("Delete"),
-        "id": st.column_config.NumberColumn("ID", disabled=True),
+        "id": None,
     }
 
 
@@ -524,14 +524,15 @@ def project_workspace(data: dict[str, pd.DataFrame]) -> None:
     with tabs[1]:
         show_gantt(schedules, tasks)
     with tabs[2]:
-        task_spreadsheet_editor(project_id, tasks, "Task table - paste from Excel")
+        default_task_type = "Major" if not tasks.empty and (tasks["task_type"].eq("Major").sum() >= tasks["task_type"].eq("Daily").sum()) else "Daily"
+        task_spreadsheet_editor(project_id, tasks, "Task table - paste from Excel", default_task_type=default_task_type, default_owner=str(p["project_manager"]))
     with tabs[3]:
         majors = tasks[tasks["task_type"].eq("Major")]
         fig = px.bar(majors, x="task_name", y="progress", color="status", color_discrete_map=STATUS_COLORS, title="Major Task Weighted Progress") if not majors.empty else None
         if fig:
             fig.update_layout(xaxis_title="", yaxis_title="Progress %", yaxis_range=[0, 100])
             st.plotly_chart(fig, use_container_width=True)
-        task_spreadsheet_editor(project_id, majors, "Major task table - paste from Excel", default_task_type="Major")
+        task_spreadsheet_editor(project_id, majors, "Major task table - paste from Excel", default_task_type="Major", default_owner=str(p["project_manager"]))
     with tabs[4]:
         risk_spreadsheet_editor(project_id, risks)
     with tabs[5]:
@@ -711,11 +712,20 @@ def task_spreadsheet_editor(
     tasks: pd.DataFrame,
     title: str = "Task table - paste from Excel",
     default_task_type: str = "Daily",
+    default_owner: str = "",
 ) -> None:
     editor_key = title.lower().replace(" ", "_").replace("-", "_")
     with st.expander(title, expanded=True):
         columns = ["task_type", "task_name", "owner", "start_date", "due_date", "status", "progress", "weight", "dependency_ids", "is_critical", "remarks"]
         editor = prepare_editor_frame(tasks, columns)
+        if "task_type" in editor:
+            editor["task_type"] = editor["task_type"].fillna(default_task_type)
+        if "status" in editor:
+            editor["status"] = editor["status"].fillna("Not Started")
+        if "progress" in editor:
+            editor["progress"] = editor["progress"].fillna(0)
+        if "weight" in editor:
+            editor["weight"] = editor["weight"].fillna(1.0)
         for col in ["start_date", "due_date"]:
             if col in editor:
                 editor[col] = pd.to_datetime(editor[col], errors="coerce").dt.date
@@ -738,6 +748,9 @@ def task_spreadsheet_editor(
         )
         if st.button("Save Table", type="primary", key=f"save_task_sheet_{project_id}_{editor_key}"):
             changed = 0
+            skipped = 0
+            last_task_type = default_task_type
+            last_owner = default_owner
             for _, row in edited.iterrows():
                 record_id = row.get("id")
                 has_id = not pd.isna(record_id) if record_id is not None else False
@@ -745,14 +758,21 @@ def task_spreadsheet_editor(
                     db.delete_record("tasks", int(record_id))
                     changed += 1
                     continue
-                if not clean_text(row.get("task_name")) and not clean_text(row.get("owner")):
+
+                current_task_type = clean_text(row.get("task_type")) or last_task_type or default_task_type
+                current_owner = clean_text(row.get("owner")) or last_owner or default_owner or "Unassigned"
+                if clean_text(row.get("task_type")):
+                    last_task_type = clean_text(row.get("task_type"))
+                if clean_text(row.get("owner")):
+                    last_owner = clean_text(row.get("owner"))
+                if not clean_text(row.get("task_name")):
                     continue
                 fields = {
-                    "task_type": clean_text(row.get("task_type")) or default_task_type,
+                    "task_type": current_task_type,
                     "task_name": clean_text(row.get("task_name")),
-                    "owner": clean_text(row.get("owner")),
+                    "owner": current_owner,
                     "start_date": clean_date(row.get("start_date"), date.today()),
-                    "due_date": clean_date(row.get("due_date"), date.today()),
+                    "due_date": clean_date(row.get("due_date"), date.today() + timedelta(days=7)),
                     "status": clean_text(row.get("status")) or "Not Started",
                     "progress": clean_int(row.get("progress")),
                     "weight": clean_float(row.get("weight"), 1.0),
@@ -760,7 +780,8 @@ def task_spreadsheet_editor(
                     "is_critical": clean_bool(row.get("is_critical")),
                     "remarks": clean_text(row.get("remarks")),
                 }
-                if not fields["task_name"] or not fields["owner"]:
+                if not fields["task_name"]:
+                    skipped += 1
                     continue
                 if has_id:
                     db.update_record("tasks", int(record_id), fields)
@@ -768,6 +789,8 @@ def task_spreadsheet_editor(
                     db.insert_record("tasks", project_id, fields)
                 changed += 1
             st.success(f"Saved {changed} task change(s).")
+            if skipped:
+                st.warning(f"Skipped {skipped} row(s) without task names.")
             refresh()
 
 
