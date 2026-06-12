@@ -90,10 +90,20 @@ def migrate_existing_database(conn: sqlite3.Connection) -> None:
 
 
 def rebuild_legacy_status_tables(conn: sqlite3.Connection) -> None:
-    legacy_tables = []
-    for table in ["projects", "tasks", "schedules"]:
+    schema_order = [
+        "projects", "tasks", "team_members", "schedules", "risk_logs", "issues", "budget_items",
+        "milestones", "authority_submissions", "documents", "meetings", "email_settings", "email_notifications",
+    ]
+    legacy_tables: list[str] = []
+    for table in schema_order:
         row = conn.execute("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?", (table,)).fetchone()
-        if row and "CHECK (status IN ('Not Started', 'In Progress', 'Done', 'At Risk'))" in (row["sql"] or ""):
+        sql = row["sql"] if row else ""
+        if not sql:
+            continue
+        if (
+            "CHECK (status IN ('Not Started', 'In Progress', 'Done', 'At Risk'))" in sql
+            or "projects_legacy_status" in sql
+        ):
             legacy_tables.append(table)
     if not legacy_tables:
         return
@@ -102,13 +112,16 @@ def rebuild_legacy_status_tables(conn: sqlite3.Connection) -> None:
     conn.execute("PRAGMA foreign_keys = OFF")
     legacy_names = {}
     for table in legacy_tables:
-        legacy_name = f"{table}_legacy_status"
+        legacy_name = f"{table}_legacy_rebuild"
         legacy_names[table] = legacy_name
         conn.execute(f"DROP TABLE IF EXISTS {legacy_name}")
         conn.execute(f"ALTER TABLE {table} RENAME TO {legacy_name}")
 
     conn.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
-    for table, legacy_name in legacy_names.items():
+    for table in schema_order:
+        if table not in legacy_names:
+            continue
+        legacy_name = legacy_names[table]
         old_cols = {row["name"] for row in conn.execute(f"PRAGMA table_info({legacy_name})").fetchall()}
         new_cols = [row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()]
         common_cols = [col for col in new_cols if col in old_cols]
@@ -250,6 +263,106 @@ def execute(sql: str, params: Iterable | None = None) -> int:
 def execute_many(sql: str, rows: list[tuple]) -> None:
     with get_connection() as conn:
         conn.executemany(sql, rows)
+
+
+ALLOWED_UPDATE_COLUMNS = {
+    "projects": {
+        "project_name", "client_name", "project_manager", "project_director", "portfolio", "template_name",
+        "priority", "start_date", "target_completion_date", "baseline_start", "baseline_finish",
+        "actual_start", "actual_finish", "status", "progress", "budget", "actual_cost", "forecast_cost", "health_score",
+    },
+    "tasks": {
+        "task_type", "task_name", "owner", "start_date", "due_date", "baseline_start", "baseline_finish",
+        "actual_start", "actual_completion_date", "status", "progress", "weight", "dependency_ids", "is_critical", "remarks",
+    },
+    "milestones": {"milestone_name", "due_date", "baseline_date", "actual_date", "status", "owner"},
+    "budget_items": {"cost_code", "category", "budget", "actual", "committed", "forecast", "owner"},
+    "risk_logs": {"title", "category", "severity", "probability", "owner", "status", "mitigation_plan", "due_date"},
+    "issues": {"title", "severity", "owner", "status", "resolution_plan", "due_date"},
+    "authority_submissions": {
+        "authority", "package_name", "owner", "target_date", "submitted_date", "approval_date",
+        "status", "reference_no", "remarks",
+    },
+    "team_members": {"name", "role", "user_role", "email", "phone", "capacity_hours", "allocated_hours"},
+}
+
+
+def update_record(table: str, record_id: int, fields: dict[str, object]) -> None:
+    if table not in ALLOWED_UPDATE_COLUMNS:
+        raise ValueError(f"Unsupported table: {table}")
+    clean = {key: normalize_value(value) for key, value in fields.items() if key in ALLOWED_UPDATE_COLUMNS[table]}
+    if not clean:
+        return
+
+    with get_connection() as conn:
+        before = conn.execute(f"SELECT * FROM {table} WHERE id = ?", (record_id,)).fetchone()
+        if before is None:
+            raise ValueError(f"Record not found: {table} #{record_id}")
+        assignments = ", ".join([f"{key} = ?" for key in clean])
+        conn.execute(f"UPDATE {table} SET {assignments} WHERE id = ?", (*clean.values(), record_id))
+        project_id = int(before["project_id"]) if "project_id" in before.keys() else int(record_id) if table == "projects" else None
+        refresh_rollups(conn, table, project_id)
+
+
+def insert_record(table: str, project_id: int, fields: dict[str, object]) -> int:
+    if table not in ALLOWED_UPDATE_COLUMNS or table == "projects":
+        raise ValueError(f"Unsupported table: {table}")
+    clean = {key: normalize_value(value) for key, value in fields.items() if key in ALLOWED_UPDATE_COLUMNS[table]}
+    clean["project_id"] = project_id
+    with get_connection() as conn:
+        columns = list(clean.keys())
+        placeholders = ", ".join(["?"] * len(columns))
+        cur = conn.execute(
+            f"INSERT INTO {table} ({', '.join(columns)}) VALUES ({placeholders})",
+            tuple(clean[column] for column in columns),
+        )
+        refresh_rollups(conn, table, project_id)
+        return int(cur.lastrowid)
+
+
+def delete_record(table: str, record_id: int) -> None:
+    if table not in ALLOWED_UPDATE_COLUMNS:
+        raise ValueError(f"Unsupported table: {table}")
+    with get_connection() as conn:
+        before = conn.execute(f"SELECT * FROM {table} WHERE id = ?", (record_id,)).fetchone()
+        if before is None:
+            return
+        project_id = int(before["project_id"]) if "project_id" in before.keys() else int(record_id) if table == "projects" else None
+        conn.execute(f"DELETE FROM {table} WHERE id = ?", (record_id,))
+        if table != "projects":
+            refresh_rollups(conn, table, project_id)
+
+
+def normalize_value(value: object) -> object:
+    if isinstance(value, (date, datetime)):
+        return value.isoformat()
+    if isinstance(value, bool):
+        return int(value)
+    return value
+
+
+def refresh_rollups(conn: sqlite3.Connection, table: str, project_id: int | None) -> None:
+    if project_id is None:
+        return
+    if table == "tasks":
+        update_project_progress(conn, project_id)
+    if table == "budget_items":
+        recalculate_project_financials(conn, project_id)
+
+
+def recalculate_project_financials(conn: sqlite3.Connection, project_id: int) -> None:
+    totals = conn.execute(
+        """
+        SELECT COALESCE(SUM(budget), 0) AS budget, COALESCE(SUM(actual), 0) AS actual, COALESCE(SUM(forecast), 0) AS forecast
+        FROM budget_items
+        WHERE project_id = ?
+        """,
+        (project_id,),
+    ).fetchone()
+    conn.execute(
+        "UPDATE projects SET budget = ?, actual_cost = ?, forecast_cost = ? WHERE id = ?",
+        (totals["budget"], totals["actual"], totals["forecast"], project_id),
+    )
 
 
 def get_project_options() -> pd.DataFrame:
@@ -522,18 +635,7 @@ def add_budget_item(project_id: int, cost_code: str, category: str, budget: floa
             """,
             (project_id, cost_code, category, budget, actual, committed, forecast, owner),
         )
-        totals = conn.execute(
-            """
-            SELECT COALESCE(SUM(budget), 0) AS budget, COALESCE(SUM(actual), 0) AS actual, COALESCE(SUM(forecast), 0) AS forecast
-            FROM budget_items
-            WHERE project_id = ?
-            """,
-            (project_id,),
-        ).fetchone()
-        conn.execute(
-            "UPDATE projects SET budget = ?, actual_cost = ?, forecast_cost = ? WHERE id = ?",
-            (totals["budget"], totals["actual"], totals["forecast"], project_id),
-        )
+        recalculate_project_financials(conn, project_id)
         return int(cur.lastrowid)
 
 

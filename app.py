@@ -301,6 +301,87 @@ def project_selector(data: dict[str, pd.DataFrame], label: str = "Project") -> t
     return project_id, projects[projects["id"] == project_id].iloc[0]
 
 
+def date_value(value: object, fallback: date | None = None) -> date | None:
+    if pd.isna(value) or value in ("", None):
+        return fallback
+    return pd.to_datetime(value).date()
+
+
+def select_index(options: list[str], value: object) -> int:
+    text = "" if pd.isna(value) else str(value)
+    return options.index(text) if text in options else 0
+
+
+def record_selector(frame: pd.DataFrame, label: str, name_col: str) -> pd.Series | None:
+    if frame.empty:
+        st.info(f"No {label.lower()} records to edit.")
+        return None
+    options = {
+        f"#{int(row.id)} - {getattr(row, name_col)}": int(row.id)
+        for row in frame.itertuples()
+    }
+    selected = st.selectbox(label, list(options.keys()))
+    return frame[frame["id"] == options[selected]].iloc[0]
+
+
+def delete_button(table: str, record_id: int, label: str, key: str) -> None:
+    if st.form_submit_button(label, type="secondary"):
+        db.delete_record(table, record_id)
+        st.success("Record deleted.")
+        refresh()
+
+
+def clean_cell(value: object, default: object = "") -> object:
+    if value is None or pd.isna(value):
+        return default
+    return value
+
+
+def clean_text(value: object) -> str:
+    return str(clean_cell(value, "")).strip()
+
+
+def clean_int(value: object, default: int = 0) -> int:
+    if value is None or pd.isna(value) or value == "":
+        return default
+    return int(float(value))
+
+
+def clean_float(value: object, default: float = 0.0) -> float:
+    if value is None or pd.isna(value) or value == "":
+        return default
+    return float(value)
+
+
+def clean_bool(value: object) -> bool:
+    if value is None or pd.isna(value):
+        return False
+    return bool(value)
+
+
+def clean_date(value: object, fallback: date | None = None) -> date | None:
+    if value is None or pd.isna(value) or value == "":
+        return fallback
+    return pd.to_datetime(value).date()
+
+
+def prepare_editor_frame(frame: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
+    if frame.empty:
+        editor = pd.DataFrame(columns=["_delete", "id", *columns])
+    else:
+        editor = frame.copy()
+        editor["_delete"] = False
+        editor = editor[["_delete", "id", *[col for col in columns if col in editor.columns]]]
+    return editor
+
+
+def editor_common_config() -> dict:
+    return {
+        "_delete": st.column_config.CheckboxColumn("Delete"),
+        "id": st.column_config.NumberColumn("ID", disabled=True),
+    }
+
+
 def portfolio_overview(data: dict[str, pd.DataFrame]) -> None:
     projects, tasks, team, milestones, budget = data["projects"], data["tasks"], data["team"], data["milestones"], data["budget"]
     today = pd.Timestamp(date.today())
@@ -436,12 +517,16 @@ def project_workspace(data: dict[str, pd.DataFrame]) -> None:
         with cols[4]:
             metric_card("Critical Tasks", str(len(tasks[(tasks["is_critical"] == 1) & (~tasks["status"].isin(["Done", "Closed"]))])), "Active path")
         st.progress(int(p["progress"]) / 100, text=f"{int(p['progress'])}% complete")
+        milestone_entry_form(project_id)
         if not milestones.empty:
+            edit_milestone_form(milestones)
             show_table(milestones, ["milestone_name", "owner", "due_date", "baseline_date", "actual_date", "status"], 260)
     with tabs[1]:
         show_gantt(schedules, tasks)
     with tabs[2]:
+        task_spreadsheet_editor(project_id, tasks)
         task_entry_form(project_id)
+        edit_task_form(tasks)
         show_table(tasks, ["task_type", "task_name", "owner", "start_date", "due_date", "status", "progress", "weight", "dependency_ids", "is_critical", "remarks"], 380)
     with tabs[3]:
         majors = tasks[tasks["task_type"].eq("Major")]
@@ -451,12 +536,19 @@ def project_workspace(data: dict[str, pd.DataFrame]) -> None:
             st.plotly_chart(fig, use_container_width=True)
         show_table(majors, ["task_name", "owner", "due_date", "status", "progress", "weight", "dependency_ids", "remarks"], 330)
     with tabs[4]:
+        risk_spreadsheet_editor(project_id, risks)
         risk_entry_form(project_id)
+        edit_risk_form(risks)
         show_table(risks, ["title", "category", "severity", "probability", "owner", "status", "due_date", "mitigation_plan"], 360)
     with tabs[5]:
+        issue_spreadsheet_editor(project_id, issues)
         issue_entry_form(project_id)
+        edit_issue_form(issues)
         show_table(issues, ["title", "severity", "owner", "status", "due_date", "resolution_plan"], 360)
     with tabs[6]:
+        budget_spreadsheet_editor(project_id, budget)
+        budget_entry_form(project_id)
+        edit_budget_form(budget)
         if not budget.empty:
             fig = px.bar(
                 budget.melt(["cost_code", "category"], value_vars=["budget", "actual", "committed", "forecast"], var_name="type", value_name="amount"),
@@ -473,6 +565,8 @@ def project_workspace(data: dict[str, pd.DataFrame]) -> None:
     with tabs[8]:
         show_table(meetings, ["meeting_date", "title", "attendees", "decisions", "actions"], 350)
     with tabs[9]:
+        team_entry_form(project_id)
+        edit_team_form(team)
         show_table(team, ["name", "role", "user_role", "email", "phone", "capacity_hours", "allocated_hours"], 350)
 
 
@@ -525,8 +619,74 @@ def project_setup(data: dict[str, pd.DataFrame]) -> None:
             db.add_milestone(project_id, "Project completion", target, status, manager)
             st.success(f"Created project: {project_name}")
             refresh()
+    edit_project_form(data["projects"])
     st.markdown('<div class="small-title">Project Register</div>', unsafe_allow_html=True)
     show_table(data["projects"], ["project_name", "client_name", "portfolio", "template_name", "project_manager", "priority", "status", "progress", "budget", "actual_cost"], 360)
+
+
+def edit_project_form(projects: pd.DataFrame) -> None:
+    with st.expander("Edit or delete existing project", expanded=False):
+        row = record_selector(projects, "Project to edit", "project_name")
+        if row is None:
+            return
+        with st.form(f"edit_project_{int(row['id'])}"):
+            c1, c2, c3 = st.columns(3)
+            project_name = c1.text_input("Project Name", value=str(row["project_name"]))
+            client_name = c2.text_input("Client Name", value=str(row["client_name"]))
+            template = c3.text_input("Template", value=str(row["template_name"]))
+            c4, c5, c6 = st.columns(3)
+            manager = c4.text_input("Project Manager", value=str(row["project_manager"]))
+            director = c5.text_input("Project Director", value=str(row["project_director"]))
+            portfolio = c6.text_input("Portfolio", value=str(row["portfolio"]))
+            c7, c8, c9 = st.columns(3)
+            start = c7.date_input("Start Date", value=date_value(row["start_date"], date.today()))
+            target = c8.date_input("Target Completion", value=date_value(row["target_completion_date"], date.today()))
+            priority_options = ["Low", "Medium", "High", "Critical"]
+            priority = c9.selectbox("Priority", priority_options, index=select_index(priority_options, row["priority"]))
+            c10, c11, c12 = st.columns(3)
+            status = c10.selectbox("Status", STATUSES, index=select_index(STATUSES, row["status"]))
+            budget = c11.number_input("Budget", min_value=0.0, value=float(row["budget"] or 0), step=10000.0)
+            actual = c12.number_input("Actual Cost", min_value=0.0, value=float(row["actual_cost"] or 0), step=10000.0)
+            c13, c14 = st.columns(2)
+            forecast = c13.number_input("Forecast Cost", min_value=0.0, value=float(row["forecast_cost"] or 0), step=10000.0)
+            health = c14.slider("Health Score", 0, 100, int(row["health_score"] or 0))
+            save, delete = st.columns([1, 1])
+            with save:
+                saved = st.form_submit_button("Save Project", type="primary")
+            with delete:
+                deleted = st.form_submit_button("Delete Project", type="secondary")
+        if saved:
+            if target < start:
+                st.error("Target completion date cannot be before start date.")
+            elif not project_name or not client_name or not manager:
+                st.error("Project name, client name, and project manager are required.")
+            else:
+                db.update_record(
+                    "projects",
+                    int(row["id"]),
+                    {
+                        "project_name": project_name,
+                        "client_name": client_name,
+                        "project_manager": manager,
+                        "project_director": director,
+                        "portfolio": portfolio,
+                        "template_name": template,
+                        "priority": priority,
+                        "start_date": start,
+                        "target_completion_date": target,
+                        "status": status,
+                        "budget": budget,
+                        "actual_cost": actual,
+                        "forecast_cost": forecast,
+                        "health_score": health,
+                    },
+                )
+                st.success("Project updated.")
+                refresh()
+        if deleted:
+            db.delete_record("projects", int(row["id"]))
+            st.success("Project deleted.")
+            refresh()
 
 
 def task_entry_form(project_id: int) -> None:
@@ -558,6 +718,299 @@ def task_entry_form(project_id: int) -> None:
                 refresh()
 
 
+def task_spreadsheet_editor(project_id: int, tasks: pd.DataFrame) -> None:
+    with st.expander("Spreadsheet task editor - paste from Excel", expanded=True):
+        columns = ["task_type", "task_name", "owner", "start_date", "due_date", "status", "progress", "weight", "dependency_ids", "is_critical", "remarks"]
+        editor = prepare_editor_frame(tasks, columns)
+        for col in ["start_date", "due_date"]:
+            if col in editor:
+                editor[col] = pd.to_datetime(editor[col], errors="coerce").dt.date
+        edited = st.data_editor(
+            editor,
+            use_container_width=True,
+            hide_index=True,
+            num_rows="dynamic",
+            key=f"task_sheet_{project_id}",
+            column_config={
+                **editor_common_config(),
+                "task_type": st.column_config.SelectboxColumn("Task Type", options=["Major", "Daily"]),
+                "status": st.column_config.SelectboxColumn("Status", options=STATUSES),
+                "start_date": st.column_config.DateColumn("Start Date"),
+                "due_date": st.column_config.DateColumn("Due Date"),
+                "progress": st.column_config.NumberColumn("Progress %", min_value=0, max_value=100),
+                "weight": st.column_config.NumberColumn("Weight", min_value=0.1),
+                "is_critical": st.column_config.CheckboxColumn("Critical"),
+            },
+        )
+        if st.button("Save Task Table", type="primary", key=f"save_task_sheet_{project_id}"):
+            changed = 0
+            for _, row in edited.iterrows():
+                record_id = row.get("id")
+                has_id = not pd.isna(record_id) if record_id is not None else False
+                if clean_bool(row.get("_delete")) and has_id:
+                    db.delete_record("tasks", int(record_id))
+                    changed += 1
+                    continue
+                if not clean_text(row.get("task_name")) and not clean_text(row.get("owner")):
+                    continue
+                fields = {
+                    "task_type": clean_text(row.get("task_type")) or "Daily",
+                    "task_name": clean_text(row.get("task_name")),
+                    "owner": clean_text(row.get("owner")),
+                    "start_date": clean_date(row.get("start_date"), date.today()),
+                    "due_date": clean_date(row.get("due_date"), date.today()),
+                    "status": clean_text(row.get("status")) or "Not Started",
+                    "progress": clean_int(row.get("progress")),
+                    "weight": clean_float(row.get("weight"), 1.0),
+                    "dependency_ids": clean_text(row.get("dependency_ids")),
+                    "is_critical": clean_bool(row.get("is_critical")),
+                    "remarks": clean_text(row.get("remarks")),
+                }
+                if not fields["task_name"] or not fields["owner"]:
+                    continue
+                if has_id:
+                    db.update_record("tasks", int(record_id), fields)
+                else:
+                    db.insert_record("tasks", project_id, fields)
+                changed += 1
+            st.success(f"Saved {changed} task change(s).")
+            refresh()
+
+
+def edit_task_form(tasks: pd.DataFrame) -> None:
+    with st.expander("Edit or delete task", expanded=False):
+        row = record_selector(tasks, "Task to edit", "task_name")
+        if row is None:
+            return
+        with st.form(f"edit_task_{int(row['id'])}"):
+            c1, c2, c3 = st.columns([2, 1, 1])
+            task_name = c1.text_input("Task Name", value=str(row["task_name"]))
+            task_type = c2.selectbox("Task Type", ["Major", "Daily"], index=select_index(["Major", "Daily"], row["task_type"]))
+            status = c3.selectbox("Status", STATUSES, index=select_index(STATUSES, row["status"]))
+            c4, c5, c6 = st.columns(3)
+            owner = c4.text_input("Owner", value=str(row["owner"]))
+            start = c5.date_input("Start Date", value=date_value(row["start_date"], date.today()))
+            due = c6.date_input("Due Date", value=date_value(row["due_date"], date.today()))
+            c7, c8, c9 = st.columns(3)
+            progress = c7.slider("Progress %", 0, 100, int(row["progress"] or 0))
+            weight = c8.number_input("Weight", min_value=0.1, value=float(row["weight"] or 1), step=0.1)
+            critical = c9.checkbox("Critical Task", value=bool(row["is_critical"]))
+            dependencies = st.text_input("Dependency IDs", value=str(row.get("dependency_ids", "") or ""))
+            remarks = st.text_area("Remarks", value=str(row.get("remarks", "") or ""))
+            c10, c11 = st.columns(2)
+            with c10:
+                saved = st.form_submit_button("Save Task", type="primary")
+            with c11:
+                deleted = st.form_submit_button("Delete Task", type="secondary")
+        if saved:
+            if not task_name or not owner:
+                st.error("Task name and owner are required.")
+            elif due < start:
+                st.error("Due date cannot be before start date.")
+            else:
+                db.update_record(
+                    "tasks",
+                    int(row["id"]),
+                    {
+                        "task_name": task_name,
+                        "task_type": task_type,
+                        "owner": owner,
+                        "start_date": start,
+                        "due_date": due,
+                        "status": status,
+                        "progress": progress,
+                        "weight": weight,
+                        "dependency_ids": dependencies,
+                        "is_critical": critical,
+                        "remarks": remarks,
+                    },
+                )
+                st.success("Task updated and project progress recalculated.")
+                refresh()
+        if deleted:
+            db.delete_record("tasks", int(row["id"]))
+            st.success("Task deleted and project progress recalculated.")
+            refresh()
+
+
+def edit_milestone_form(milestones: pd.DataFrame) -> None:
+    with st.expander("Edit or delete milestone", expanded=False):
+        row = record_selector(milestones, "Milestone to edit", "milestone_name")
+        if row is None:
+            return
+        with st.form(f"edit_milestone_{int(row['id'])}"):
+            c1, c2, c3 = st.columns(3)
+            name = c1.text_input("Milestone Name", value=str(row["milestone_name"]))
+            owner = c2.text_input("Owner", value=str(row["owner"] or ""))
+            status = c3.selectbox("Status", STATUSES, index=select_index(STATUSES, row["status"]))
+            c4, c5, c6 = st.columns(3)
+            due = c4.date_input("Due Date", value=date_value(row["due_date"], date.today()))
+            baseline = c5.date_input("Baseline Date", value=date_value(row["baseline_date"], due))
+            actual = c6.date_input("Actual Date", value=date_value(row["actual_date"], due))
+            clear_actual = st.checkbox("Clear actual date", value=pd.isna(row["actual_date"]) or not row["actual_date"])
+            c7, c8 = st.columns(2)
+            with c7:
+                saved = st.form_submit_button("Save Milestone", type="primary")
+            with c8:
+                deleted = st.form_submit_button("Delete Milestone", type="secondary")
+        if saved:
+            if not name:
+                st.error("Milestone name is required.")
+            else:
+                db.update_record(
+                    "milestones",
+                    int(row["id"]),
+                    {
+                        "milestone_name": name,
+                        "owner": owner,
+                        "status": status,
+                        "due_date": due,
+                        "baseline_date": baseline,
+                        "actual_date": None if clear_actual else actual,
+                    },
+                )
+                st.success("Milestone updated.")
+                refresh()
+        if deleted:
+            db.delete_record("milestones", int(row["id"]))
+            st.success("Milestone deleted.")
+            refresh()
+
+
+def milestone_entry_form(project_id: int) -> None:
+    with st.expander("Add milestone", expanded=False):
+        with st.form(f"milestone_form_{project_id}"):
+            c1, c2, c3 = st.columns(3)
+            name = c1.text_input("Milestone Name")
+            owner = c2.text_input("Owner")
+            status = c3.selectbox("Status", STATUSES)
+            due = st.date_input("Due Date", value=date.today() + timedelta(days=14))
+            submitted = st.form_submit_button("Add Milestone", type="primary")
+        if submitted:
+            if not name:
+                st.error("Milestone name is required.")
+            else:
+                db.add_milestone(project_id, name, due, status, owner)
+                st.success("Milestone added.")
+                refresh()
+
+
+def budget_entry_form(project_id: int) -> None:
+    with st.expander("Add budget item", expanded=False):
+        with st.form(f"budget_form_{project_id}"):
+            c1, c2, c3 = st.columns(3)
+            cost_code = c1.text_input("Cost Code")
+            category = c2.text_input("Category")
+            owner = c3.text_input("Owner")
+            c4, c5, c6, c7 = st.columns(4)
+            budget = c4.number_input("Budget", min_value=0.0, value=0.0, step=1000.0)
+            actual = c5.number_input("Actual", min_value=0.0, value=0.0, step=1000.0)
+            committed = c6.number_input("Committed", min_value=0.0, value=0.0, step=1000.0)
+            forecast = c7.number_input("Forecast", min_value=0.0, value=0.0, step=1000.0)
+            submitted = st.form_submit_button("Add Budget Item", type="primary")
+        if submitted:
+            if not cost_code or not category:
+                st.error("Cost code and category are required.")
+            else:
+                db.add_budget_item(project_id, cost_code, category, budget, actual, committed, forecast, owner)
+                st.success("Budget item added and project totals recalculated.")
+                refresh()
+
+
+def budget_spreadsheet_editor(project_id: int, budget_frame: pd.DataFrame) -> None:
+    with st.expander("Spreadsheet budget editor - paste from Excel", expanded=True):
+        columns = ["cost_code", "category", "budget", "actual", "committed", "forecast", "owner"]
+        editor = prepare_editor_frame(budget_frame, columns)
+        edited = st.data_editor(
+            editor,
+            use_container_width=True,
+            hide_index=True,
+            num_rows="dynamic",
+            key=f"budget_sheet_{project_id}",
+            column_config={
+                **editor_common_config(),
+                "budget": st.column_config.NumberColumn("Budget", min_value=0),
+                "actual": st.column_config.NumberColumn("Actual", min_value=0),
+                "committed": st.column_config.NumberColumn("Committed", min_value=0),
+                "forecast": st.column_config.NumberColumn("Forecast", min_value=0),
+            },
+        )
+        if st.button("Save Budget Table", type="primary", key=f"save_budget_sheet_{project_id}"):
+            changed = 0
+            for _, row in edited.iterrows():
+                record_id = row.get("id")
+                has_id = not pd.isna(record_id) if record_id is not None else False
+                if clean_bool(row.get("_delete")) and has_id:
+                    db.delete_record("budget_items", int(record_id))
+                    changed += 1
+                    continue
+                if not clean_text(row.get("cost_code")) and not clean_text(row.get("category")):
+                    continue
+                fields = {
+                    "cost_code": clean_text(row.get("cost_code")),
+                    "category": clean_text(row.get("category")),
+                    "budget": clean_float(row.get("budget")),
+                    "actual": clean_float(row.get("actual")),
+                    "committed": clean_float(row.get("committed")),
+                    "forecast": clean_float(row.get("forecast")),
+                    "owner": clean_text(row.get("owner")),
+                }
+                if not fields["cost_code"] or not fields["category"]:
+                    continue
+                if has_id:
+                    db.update_record("budget_items", int(record_id), fields)
+                else:
+                    db.insert_record("budget_items", project_id, fields)
+                changed += 1
+            st.success(f"Saved {changed} budget change(s).")
+            refresh()
+
+
+def edit_budget_form(budget_frame: pd.DataFrame) -> None:
+    with st.expander("Edit or delete budget item", expanded=False):
+        row = record_selector(budget_frame, "Budget item to edit", "cost_code")
+        if row is None:
+            return
+        with st.form(f"edit_budget_{int(row['id'])}"):
+            c1, c2, c3 = st.columns(3)
+            cost_code = c1.text_input("Cost Code", value=str(row["cost_code"]))
+            category = c2.text_input("Category", value=str(row["category"]))
+            owner = c3.text_input("Owner", value=str(row["owner"] or ""))
+            c4, c5, c6, c7 = st.columns(4)
+            budget = c4.number_input("Budget", min_value=0.0, value=float(row["budget"] or 0), step=1000.0)
+            actual = c5.number_input("Actual", min_value=0.0, value=float(row["actual"] or 0), step=1000.0)
+            committed = c6.number_input("Committed", min_value=0.0, value=float(row["committed"] or 0), step=1000.0)
+            forecast = c7.number_input("Forecast", min_value=0.0, value=float(row["forecast"] or 0), step=1000.0)
+            c8, c9 = st.columns(2)
+            with c8:
+                saved = st.form_submit_button("Save Budget Item", type="primary")
+            with c9:
+                deleted = st.form_submit_button("Delete Budget Item", type="secondary")
+        if saved:
+            if not cost_code or not category:
+                st.error("Cost code and category are required.")
+            else:
+                db.update_record(
+                    "budget_items",
+                    int(row["id"]),
+                    {
+                        "cost_code": cost_code,
+                        "category": category,
+                        "budget": budget,
+                        "actual": actual,
+                        "committed": committed,
+                        "forecast": forecast,
+                        "owner": owner,
+                    },
+                )
+                st.success("Budget item updated and project totals recalculated.")
+                refresh()
+        if deleted:
+            db.delete_record("budget_items", int(row["id"]))
+            st.success("Budget item deleted and project totals recalculated.")
+            refresh()
+
+
 def risk_entry_form(project_id: int) -> None:
     with st.expander("Add risk", expanded=False):
         with st.form(f"risk_form_{project_id}"):
@@ -581,6 +1034,111 @@ def risk_entry_form(project_id: int) -> None:
                 refresh()
 
 
+def risk_spreadsheet_editor(project_id: int, risks: pd.DataFrame) -> None:
+    with st.expander("Spreadsheet risk editor - paste from Excel", expanded=True):
+        columns = ["title", "category", "severity", "probability", "owner", "status", "due_date", "mitigation_plan"]
+        editor = prepare_editor_frame(risks, columns)
+        if "due_date" in editor:
+            editor["due_date"] = pd.to_datetime(editor["due_date"], errors="coerce").dt.date
+        severity_options = ["Low", "Medium", "High", "Critical"]
+        probability_options = ["Low", "Medium", "High"]
+        status_options = ["Open", "Monitoring", "Closed"]
+        edited = st.data_editor(
+            editor,
+            use_container_width=True,
+            hide_index=True,
+            num_rows="dynamic",
+            key=f"risk_sheet_{project_id}",
+            column_config={
+                **editor_common_config(),
+                "severity": st.column_config.SelectboxColumn("Severity", options=severity_options),
+                "probability": st.column_config.SelectboxColumn("Probability", options=probability_options),
+                "status": st.column_config.SelectboxColumn("Status", options=status_options),
+                "due_date": st.column_config.DateColumn("Review Date"),
+            },
+        )
+        if st.button("Save Risk Table", type="primary", key=f"save_risk_sheet_{project_id}"):
+            changed = 0
+            for _, row in edited.iterrows():
+                record_id = row.get("id")
+                has_id = not pd.isna(record_id) if record_id is not None else False
+                if clean_bool(row.get("_delete")) and has_id:
+                    db.delete_record("risk_logs", int(record_id))
+                    changed += 1
+                    continue
+                if not clean_text(row.get("title")) and not clean_text(row.get("owner")):
+                    continue
+                fields = {
+                    "title": clean_text(row.get("title")),
+                    "category": clean_text(row.get("category")) or "Project",
+                    "severity": clean_text(row.get("severity")) or "Medium",
+                    "probability": clean_text(row.get("probability")) or "Medium",
+                    "owner": clean_text(row.get("owner")),
+                    "status": clean_text(row.get("status")) or "Open",
+                    "due_date": clean_date(row.get("due_date")),
+                    "mitigation_plan": clean_text(row.get("mitigation_plan")) or "-",
+                }
+                if not fields["title"] or not fields["owner"]:
+                    continue
+                if has_id:
+                    db.update_record("risk_logs", int(record_id), fields)
+                else:
+                    db.insert_record("risk_logs", project_id, fields)
+                changed += 1
+            st.success(f"Saved {changed} risk change(s).")
+            refresh()
+
+
+def edit_risk_form(risks: pd.DataFrame) -> None:
+    with st.expander("Edit or delete risk", expanded=False):
+        row = record_selector(risks, "Risk to edit", "title")
+        if row is None:
+            return
+        severity_options = ["Low", "Medium", "High", "Critical"]
+        probability_options = ["Low", "Medium", "High"]
+        status_options = ["Open", "Monitoring", "Closed"]
+        with st.form(f"edit_risk_{int(row['id'])}"):
+            c1, c2, c3 = st.columns(3)
+            title = c1.text_input("Risk Title", value=str(row["title"]))
+            category = c2.text_input("Category", value=str(row["category"] or "Project"))
+            severity = c3.selectbox("Severity", severity_options, index=select_index(severity_options, row["severity"]))
+            c4, c5, c6 = st.columns(3)
+            probability = c4.selectbox("Probability", probability_options, index=select_index(probability_options, row["probability"]))
+            owner = c5.text_input("Owner", value=str(row["owner"]))
+            due_date = c6.date_input("Review Date", value=date_value(row["due_date"], date.today()))
+            status = st.selectbox("Status", status_options, index=select_index(status_options, row["status"]))
+            mitigation = st.text_area("Mitigation / Catch-up Plan", value=str(row["mitigation_plan"]))
+            c7, c8 = st.columns(2)
+            with c7:
+                saved = st.form_submit_button("Save Risk", type="primary")
+            with c8:
+                deleted = st.form_submit_button("Delete Risk", type="secondary")
+        if saved:
+            if not title or not owner or not mitigation:
+                st.error("Title, owner, and mitigation plan are required.")
+            else:
+                db.update_record(
+                    "risk_logs",
+                    int(row["id"]),
+                    {
+                        "title": title,
+                        "category": category,
+                        "severity": severity,
+                        "probability": probability,
+                        "owner": owner,
+                        "status": status,
+                        "mitigation_plan": mitigation,
+                        "due_date": due_date,
+                    },
+                )
+                st.success("Risk updated.")
+                refresh()
+        if deleted:
+            db.delete_record("risk_logs", int(row["id"]))
+            st.success("Risk deleted.")
+            refresh()
+
+
 def issue_entry_form(project_id: int) -> None:
     with st.expander("Add issue", expanded=False):
         with st.form(f"issue_form_{project_id}"):
@@ -600,6 +1158,171 @@ def issue_entry_form(project_id: int) -> None:
                 db.add_issue(project_id, title, severity, owner, status, plan, due_date)
                 st.success("Issue added.")
                 refresh()
+
+
+def issue_spreadsheet_editor(project_id: int, issues: pd.DataFrame) -> None:
+    with st.expander("Spreadsheet issue editor - paste from Excel", expanded=True):
+        columns = ["title", "severity", "owner", "status", "due_date", "resolution_plan"]
+        editor = prepare_editor_frame(issues, columns)
+        if "due_date" in editor:
+            editor["due_date"] = pd.to_datetime(editor["due_date"], errors="coerce").dt.date
+        severity_options = ["Low", "Medium", "High", "Critical"]
+        status_options = ["Open", "In Progress", "Closed"]
+        edited = st.data_editor(
+            editor,
+            use_container_width=True,
+            hide_index=True,
+            num_rows="dynamic",
+            key=f"issue_sheet_{project_id}",
+            column_config={
+                **editor_common_config(),
+                "severity": st.column_config.SelectboxColumn("Severity", options=severity_options),
+                "status": st.column_config.SelectboxColumn("Status", options=status_options),
+                "due_date": st.column_config.DateColumn("Resolution Due"),
+            },
+        )
+        if st.button("Save Issue Table", type="primary", key=f"save_issue_sheet_{project_id}"):
+            changed = 0
+            for _, row in edited.iterrows():
+                record_id = row.get("id")
+                has_id = not pd.isna(record_id) if record_id is not None else False
+                if clean_bool(row.get("_delete")) and has_id:
+                    db.delete_record("issues", int(record_id))
+                    changed += 1
+                    continue
+                if not clean_text(row.get("title")) and not clean_text(row.get("owner")):
+                    continue
+                fields = {
+                    "title": clean_text(row.get("title")),
+                    "severity": clean_text(row.get("severity")) or "Medium",
+                    "owner": clean_text(row.get("owner")),
+                    "status": clean_text(row.get("status")) or "Open",
+                    "due_date": clean_date(row.get("due_date")),
+                    "resolution_plan": clean_text(row.get("resolution_plan")) or "-",
+                }
+                if not fields["title"] or not fields["owner"]:
+                    continue
+                if has_id:
+                    db.update_record("issues", int(record_id), fields)
+                else:
+                    db.insert_record("issues", project_id, fields)
+                changed += 1
+            st.success(f"Saved {changed} issue change(s).")
+            refresh()
+
+
+def edit_issue_form(issues: pd.DataFrame) -> None:
+    with st.expander("Edit or delete issue", expanded=False):
+        row = record_selector(issues, "Issue to edit", "title")
+        if row is None:
+            return
+        severity_options = ["Low", "Medium", "High", "Critical"]
+        status_options = ["Open", "In Progress", "Closed"]
+        with st.form(f"edit_issue_{int(row['id'])}"):
+            c1, c2, c3 = st.columns(3)
+            title = c1.text_input("Issue Title", value=str(row["title"]))
+            severity = c2.selectbox("Severity", severity_options, index=select_index(severity_options, row["severity"]))
+            owner = c3.text_input("Owner", value=str(row["owner"]))
+            c4, c5 = st.columns(2)
+            status = c4.selectbox("Status", status_options, index=select_index(status_options, row["status"]))
+            due_date = c5.date_input("Resolution Due", value=date_value(row["due_date"], date.today()))
+            plan = st.text_area("Resolution Plan", value=str(row["resolution_plan"]))
+            c6, c7 = st.columns(2)
+            with c6:
+                saved = st.form_submit_button("Save Issue", type="primary")
+            with c7:
+                deleted = st.form_submit_button("Delete Issue", type="secondary")
+        if saved:
+            if not title or not owner or not plan:
+                st.error("Title, owner, and resolution plan are required.")
+            else:
+                db.update_record(
+                    "issues",
+                    int(row["id"]),
+                    {
+                        "title": title,
+                        "severity": severity,
+                        "owner": owner,
+                        "status": status,
+                        "resolution_plan": plan,
+                        "due_date": due_date,
+                    },
+                )
+                st.success("Issue updated.")
+                refresh()
+        if deleted:
+            db.delete_record("issues", int(row["id"]))
+            st.success("Issue deleted.")
+            refresh()
+
+
+def team_entry_form(project_id: int) -> None:
+    with st.expander("Add team member", expanded=False):
+        with st.form(f"team_form_{project_id}"):
+            c1, c2, c3 = st.columns(3)
+            name = c1.text_input("Name")
+            role = c2.text_input("Project Role")
+            user_role = c3.selectbox("User Role", USER_ROLES)
+            c4, c5 = st.columns(2)
+            email = c4.text_input("Email")
+            phone = c5.text_input("Phone")
+            c6, c7 = st.columns(2)
+            capacity = c6.number_input("Capacity Hours", min_value=0.0, value=40.0, step=1.0)
+            allocated = c7.number_input("Allocated Hours", min_value=0.0, value=32.0, step=1.0)
+            submitted = st.form_submit_button("Add Team Member", type="primary")
+        if submitted:
+            if not name or not role:
+                st.error("Name and project role are required.")
+            else:
+                db.add_team_member(project_id, name, role, email, phone, user_role, capacity, allocated)
+                st.success("Team member added.")
+                refresh()
+
+
+def edit_team_form(team: pd.DataFrame) -> None:
+    with st.expander("Edit or delete team member", expanded=False):
+        row = record_selector(team, "Team member to edit", "name")
+        if row is None:
+            return
+        with st.form(f"edit_team_{int(row['id'])}"):
+            c1, c2, c3 = st.columns(3)
+            name = c1.text_input("Name", value=str(row["name"]))
+            role = c2.text_input("Project Role", value=str(row["role"]))
+            user_role = c3.selectbox("User Role", USER_ROLES, index=select_index(USER_ROLES, row["user_role"]))
+            c4, c5 = st.columns(2)
+            email = c4.text_input("Email", value=str(row["email"] or ""))
+            phone = c5.text_input("Phone", value=str(row["phone"] or ""))
+            c6, c7 = st.columns(2)
+            capacity = c6.number_input("Capacity Hours", min_value=0.0, value=float(row["capacity_hours"] or 0), step=1.0)
+            allocated = c7.number_input("Allocated Hours", min_value=0.0, value=float(row["allocated_hours"] or 0), step=1.0)
+            c8, c9 = st.columns(2)
+            with c8:
+                saved = st.form_submit_button("Save Team Member", type="primary")
+            with c9:
+                deleted = st.form_submit_button("Delete Team Member", type="secondary")
+        if saved:
+            if not name or not role:
+                st.error("Name and project role are required.")
+            else:
+                db.update_record(
+                    "team_members",
+                    int(row["id"]),
+                    {
+                        "name": name,
+                        "role": role,
+                        "user_role": user_role,
+                        "email": email,
+                        "phone": phone,
+                        "capacity_hours": capacity,
+                        "allocated_hours": allocated,
+                    },
+                )
+                st.success("Team member updated.")
+                refresh()
+        if deleted:
+            db.delete_record("team_members", int(row["id"]))
+            st.success("Team member deleted.")
+            refresh()
 
 
 def solar_pv_module(data: dict[str, pd.DataFrame]) -> None:
@@ -643,7 +1366,60 @@ def solar_pv_module(data: dict[str, pd.DataFrame]) -> None:
                     db.add_authority_submission(project_id, authority_name, package, owner, target, status, reference, remarks)
                     st.success("Tracker item added.")
                     refresh()
+    edit_authority_form(authority)
     show_table(authority, ["project_name", "authority", "package_name", "owner", "target_date", "submitted_date", "approval_date", "status", "reference_no", "remarks"], 430)
+
+
+def edit_authority_form(authority: pd.DataFrame) -> None:
+    with st.expander("Edit or delete Solar PV tracker item", expanded=False):
+        row = record_selector(authority, "Tracker item to edit", "package_name")
+        if row is None:
+            return
+        with st.form(f"edit_authority_{int(row['id'])}"):
+            c1, c2, c3 = st.columns(3)
+            authority_name = c1.selectbox("Tracker", AUTHORITY_TYPES, index=select_index(AUTHORITY_TYPES, row["authority"]))
+            package = c2.text_input("Package / Workstream", value=str(row["package_name"]))
+            owner = c3.text_input("Owner", value=str(row["owner"]))
+            c4, c5, c6 = st.columns(3)
+            target = c4.date_input("Target Date", value=date_value(row["target_date"], date.today()))
+            status = c5.selectbox("Status", STATUSES, index=select_index(STATUSES, row["status"]))
+            reference = c6.text_input("Reference No.", value=str(row["reference_no"] or ""))
+            c7, c8 = st.columns(2)
+            submitted_date = c7.date_input("Submitted Date", value=date_value(row["submitted_date"], target))
+            approval_date = c8.date_input("Approval Date", value=date_value(row["approval_date"], target))
+            clear_submitted = st.checkbox("Clear submitted date", value=pd.isna(row["submitted_date"]) or not row["submitted_date"])
+            clear_approval = st.checkbox("Clear approval date", value=pd.isna(row["approval_date"]) or not row["approval_date"])
+            remarks = st.text_area("Remarks", value=str(row["remarks"] or ""))
+            c9, c10 = st.columns(2)
+            with c9:
+                saved = st.form_submit_button("Save Tracker Item", type="primary")
+            with c10:
+                deleted = st.form_submit_button("Delete Tracker Item", type="secondary")
+        if saved:
+            if not package or not owner:
+                st.error("Package and owner are required.")
+            else:
+                db.update_record(
+                    "authority_submissions",
+                    int(row["id"]),
+                    {
+                        "authority": authority_name,
+                        "package_name": package,
+                        "owner": owner,
+                        "target_date": target,
+                        "submitted_date": None if clear_submitted else submitted_date,
+                        "approval_date": None if clear_approval else approval_date,
+                        "status": status,
+                        "reference_no": reference,
+                        "remarks": remarks,
+                    },
+                )
+                st.success("Tracker item updated.")
+                refresh()
+        if deleted:
+            db.delete_record("authority_submissions", int(row["id"]))
+            st.success("Tracker item deleted.")
+            refresh()
 
 
 def reports_center(data: dict[str, pd.DataFrame]) -> None:
