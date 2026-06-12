@@ -733,6 +733,7 @@ def task_spreadsheet_editor(
             editor,
             use_container_width=True,
             hide_index=True,
+            height=420,
             num_rows="dynamic",
             key=f"task_sheet_{project_id}_{editor_key}",
             column_config={
@@ -746,6 +747,12 @@ def task_spreadsheet_editor(
                 "is_critical": st.column_config.CheckboxColumn("Critical"),
             },
         )
+        unsaved_rows = edited[
+            edited["id"].isna()
+            & edited["task_name"].apply(lambda value: bool(clean_text(value)))
+        ] if "id" in edited.columns and "task_name" in edited.columns else pd.DataFrame()
+        if not unsaved_rows.empty:
+            st.warning(f"{len(unsaved_rows)} new task row(s) are not saved yet. Click Save Table before opening Major Tasks.")
         if st.button("Save Table", type="primary", key=f"save_task_sheet_{project_id}_{editor_key}"):
             changed = 0
             skipped = 0
