@@ -494,6 +494,10 @@ def project_workspace(data: dict[str, pd.DataFrame]) -> None:
         unsafe_allow_html=True,
     )
     tasks = data["tasks"][data["tasks"]["project_id"] == project_id]
+    created_schedule_rows = db.ensure_schedules_for_major_tasks(project_id)
+    if created_schedule_rows:
+        st.toast(f"Created {created_schedule_rows} schedule row(s) from Major tasks.")
+        refresh()
     schedules = data["schedules"][data["schedules"]["project_id"] == project_id]
     risks = data["risks"][data["risks"]["project_id"] == project_id]
     issues = data["issues"][data["issues"]["project_id"] == project_id]
@@ -854,10 +858,14 @@ def task_spreadsheet_editor(
             skipped = 0
             last_task_type = default_task_type
             last_owner = default_owner
+            task_by_id = {int(row.id): row for row in tasks.itertuples()} if not tasks.empty else {}
             for _, row in edited.iterrows():
                 record_id = row.get("id")
                 has_id = not pd.isna(record_id) if record_id is not None else False
                 if clean_bool(row.get("_delete")) and has_id:
+                    old_task = task_by_id.get(int(record_id))
+                    if old_task and str(getattr(old_task, "task_type", "")) == "Major":
+                        db.delete_schedule_for_task(project_id, str(getattr(old_task, "task_name", "") or ""))
                     db.delete_record("tasks", int(record_id))
                     changed += 1
                     continue
@@ -887,9 +895,18 @@ def task_spreadsheet_editor(
                     skipped += 1
                     continue
                 if has_id:
+                    old_task = task_by_id.get(int(record_id))
+                    old_task_name = str(getattr(old_task, "task_name", fields["task_name"]) or fields["task_name"]) if old_task else fields["task_name"]
+                    old_task_type = str(getattr(old_task, "task_type", "") or "") if old_task else ""
                     db.update_record("tasks", int(record_id), fields)
+                    if fields["task_type"] == "Major":
+                        db.sync_schedule_from_task(project_id, old_task_name, fields)
+                    elif old_task_type == "Major":
+                        db.delete_schedule_for_task(project_id, old_task_name)
                 else:
                     db.insert_record("tasks", project_id, fields)
+                    if fields["task_type"] == "Major":
+                        db.sync_schedule_from_task(project_id, fields["task_name"], fields)
                 changed += 1
             st.success(f"Saved {changed} task change(s).")
             if skipped:

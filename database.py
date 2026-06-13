@@ -469,6 +469,174 @@ def delete_task_for_schedule(project_id: int, activity_name: str) -> None:
         update_project_progress(conn, project_id)
 
 
+def sync_schedule_from_task(project_id: int, old_task_name: str, fields: dict[str, object]) -> None:
+    if str(fields.get("task_type") or "").strip() != "Major":
+        return
+    task_name = str(fields.get("task_name") or old_task_name or "").strip()
+    if not task_name:
+        return
+    planned_start = normalize_value(fields.get("start_date") or date.today())
+    planned_finish = normalize_value(fields.get("due_date") or date.today())
+    baseline_start = normalize_value(fields.get("baseline_start") or fields.get("start_date") or date.today())
+    baseline_finish = normalize_value(fields.get("baseline_finish") or fields.get("due_date") or date.today())
+    actual_start = normalize_value(fields.get("actual_start")) if fields.get("actual_start") else None
+    actual_finish = normalize_value(fields.get("actual_completion_date")) if fields.get("actual_completion_date") else None
+    status = str(fields.get("status") or "Not Started")
+    progress = int(fields.get("progress") or 0)
+    remarks = str(fields.get("remarks") or "")
+
+    with get_connection() as conn:
+        existing = conn.execute(
+            """
+            SELECT id
+            FROM schedules
+            WHERE project_id = ?
+              AND LOWER(TRIM(activity_name)) IN (LOWER(TRIM(?)), LOWER(TRIM(?)))
+            ORDER BY id
+            LIMIT 1
+            """,
+            (project_id, old_task_name or task_name, task_name),
+        ).fetchone()
+        delay_days = calculate_delay(pd_date(planned_finish), pd_date(actual_finish) if actual_finish else None)
+        if existing:
+            conn.execute(
+                """
+                UPDATE schedules
+                SET activity_name = ?,
+                    planned_start = ?,
+                    planned_finish = ?,
+                    baseline_start = ?,
+                    baseline_finish = ?,
+                    actual_start = ?,
+                    actual_finish = ?,
+                    delay_days = ?,
+                    progress = ?,
+                    status = ?,
+                    remarks = ?
+                WHERE id = ?
+                """,
+                (
+                    task_name,
+                    planned_start,
+                    planned_finish,
+                    baseline_start,
+                    baseline_finish,
+                    actual_start,
+                    actual_finish,
+                    delay_days,
+                    progress,
+                    status,
+                    remarks,
+                    int(existing["id"]),
+                ),
+            )
+        else:
+            conn.execute(
+                """
+                INSERT INTO schedules (
+                    project_id, activity_name, planned_start, planned_finish, baseline_start,
+                    baseline_finish, actual_start, actual_finish, delay_days, progress, status, remarks
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    project_id,
+                    task_name,
+                    planned_start,
+                    planned_finish,
+                    baseline_start,
+                    baseline_finish,
+                    actual_start,
+                    actual_finish,
+                    delay_days,
+                    progress,
+                    status,
+                    remarks,
+                ),
+            )
+
+
+def delete_schedule_for_task(project_id: int, task_name: str) -> None:
+    if not task_name:
+        return
+    with get_connection() as conn:
+        conn.execute(
+            """
+            DELETE FROM schedules
+            WHERE project_id = ?
+              AND LOWER(TRIM(activity_name)) = LOWER(TRIM(?))
+            """,
+            (project_id, task_name),
+        )
+
+
+def ensure_schedules_for_major_tasks(project_id: int) -> int:
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT
+                t.task_name,
+                t.start_date,
+                t.due_date,
+                t.baseline_start,
+                t.baseline_finish,
+                t.actual_start,
+                t.actual_completion_date,
+                t.status,
+                t.progress,
+                t.remarks,
+                p.start_date AS project_start,
+                p.target_completion_date AS project_finish
+            FROM tasks t
+            JOIN projects p ON p.id = t.project_id
+            WHERE t.project_id = ?
+              AND t.task_type = 'Major'
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM schedules s
+                  WHERE s.project_id = t.project_id
+                    AND LOWER(TRIM(s.activity_name)) = LOWER(TRIM(t.task_name))
+              )
+            ORDER BY t.id
+            """,
+            (project_id,),
+        ).fetchall()
+        for row in rows:
+            planned_start = row["start_date"] or row["project_start"]
+            planned_finish = row["due_date"] or row["project_finish"]
+            actual_finish = row["actual_completion_date"]
+            conn.execute(
+                """
+                INSERT INTO schedules (
+                    project_id, activity_name, planned_start, planned_finish, baseline_start,
+                    baseline_finish, actual_start, actual_finish, delay_days, progress, status, remarks
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    project_id,
+                    row["task_name"],
+                    planned_start,
+                    planned_finish,
+                    row["baseline_start"] or planned_start,
+                    row["baseline_finish"] or planned_finish,
+                    row["actual_start"],
+                    actual_finish,
+                    calculate_delay(pd_date(planned_finish), pd_date(actual_finish) if actual_finish else None),
+                    int(row["progress"] or 0),
+                    row["status"] or "Not Started",
+                    row["remarks"] or "",
+                ),
+            )
+        return len(rows)
+
+
+def pd_date(value: object) -> date:
+    if isinstance(value, date):
+        return value
+    return datetime.fromisoformat(str(value)).date()
+
+
 def get_project_options() -> pd.DataFrame:
     return query_df(
         """
