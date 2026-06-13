@@ -275,6 +275,10 @@ ALLOWED_UPDATE_COLUMNS = {
         "task_type", "task_name", "owner", "start_date", "due_date", "baseline_start", "baseline_finish",
         "actual_start", "actual_completion_date", "status", "progress", "weight", "dependency_ids", "is_critical", "remarks",
     },
+    "schedules": {
+        "activity_name", "planned_start", "planned_finish", "baseline_start", "baseline_finish",
+        "actual_start", "actual_finish", "delay_days", "progress", "status", "remarks",
+    },
     "milestones": {"milestone_name", "due_date", "baseline_date", "actual_date", "status", "owner"},
     "budget_items": {"cost_code", "category", "budget", "actual", "committed", "forecast", "owner"},
     "risk_logs": {"title", "category", "severity", "probability", "owner", "status", "mitigation_plan", "due_date"},
@@ -363,6 +367,106 @@ def recalculate_project_financials(conn: sqlite3.Connection, project_id: int) ->
         "UPDATE projects SET budget = ?, actual_cost = ?, forecast_cost = ? WHERE id = ?",
         (totals["budget"], totals["actual"], totals["forecast"], project_id),
     )
+
+
+def sync_task_from_schedule(project_id: int, old_activity_name: str, fields: dict[str, object]) -> None:
+    activity_name = str(fields.get("activity_name") or old_activity_name or "").strip()
+    if not activity_name:
+        return
+    planned_start = normalize_value(fields.get("planned_start") or date.today())
+    planned_finish = normalize_value(fields.get("planned_finish") or date.today())
+    baseline_start = normalize_value(fields.get("baseline_start") or fields.get("planned_start") or date.today())
+    baseline_finish = normalize_value(fields.get("baseline_finish") or fields.get("planned_finish") or date.today())
+    actual_start = normalize_value(fields.get("actual_start")) if fields.get("actual_start") else None
+    actual_finish = normalize_value(fields.get("actual_finish")) if fields.get("actual_finish") else None
+    status = str(fields.get("status") or "Not Started")
+    progress = int(fields.get("progress") or 0)
+    remarks = str(fields.get("remarks") or "")
+
+    with get_connection() as conn:
+        existing = conn.execute(
+            """
+            SELECT id
+            FROM tasks
+            WHERE project_id = ?
+              AND LOWER(TRIM(task_name)) IN (LOWER(TRIM(?)), LOWER(TRIM(?)))
+            ORDER BY id
+            LIMIT 1
+            """,
+            (project_id, old_activity_name or activity_name, activity_name),
+        ).fetchone()
+        if existing:
+            conn.execute(
+                """
+                UPDATE tasks
+                SET task_type = 'Major',
+                    task_name = ?,
+                    start_date = ?,
+                    due_date = ?,
+                    baseline_start = ?,
+                    baseline_finish = ?,
+                    actual_start = ?,
+                    actual_completion_date = ?,
+                    status = ?,
+                    progress = ?,
+                    remarks = ?
+                WHERE id = ?
+                """,
+                (
+                    activity_name,
+                    planned_start,
+                    planned_finish,
+                    baseline_start,
+                    baseline_finish,
+                    actual_start,
+                    actual_finish,
+                    status,
+                    progress,
+                    remarks,
+                    int(existing["id"]),
+                ),
+            )
+        else:
+            conn.execute(
+                """
+                INSERT INTO tasks (
+                    project_id, task_type, task_name, owner, start_date, due_date, baseline_start,
+                    baseline_finish, actual_start, actual_completion_date, status, progress, weight,
+                    dependency_ids, is_critical, remarks
+                )
+                VALUES (?, 'Major', ?, 'Schedule', ?, ?, ?, ?, ?, ?, ?, ?, 1, '', 0, ?)
+                """,
+                (
+                    project_id,
+                    activity_name,
+                    planned_start,
+                    planned_finish,
+                    baseline_start,
+                    baseline_finish,
+                    actual_start,
+                    actual_finish,
+                    status,
+                    progress,
+                    remarks,
+                ),
+            )
+        update_project_progress(conn, project_id)
+
+
+def delete_task_for_schedule(project_id: int, activity_name: str) -> None:
+    if not activity_name:
+        return
+    with get_connection() as conn:
+        conn.execute(
+            """
+            DELETE FROM tasks
+            WHERE project_id = ?
+              AND task_type = 'Major'
+              AND LOWER(TRIM(task_name)) = LOWER(TRIM(?))
+            """,
+            (project_id, activity_name),
+        )
+        update_project_progress(conn, project_id)
 
 
 def get_project_options() -> pd.DataFrame:
