@@ -568,15 +568,31 @@ def show_gantt(schedules: pd.DataFrame, tasks: pd.DataFrame) -> None:
     if schedules.empty and tasks.empty:
         st.info("No schedule or task records yet.")
         return
-    source = schedules.rename(columns={"activity_name": "name", "planned_start": "start", "planned_finish": "finish"}).copy()
-    source["record_type"] = "Schedule"
-    task_source = tasks.rename(columns={"task_name": "name", "start_date": "start", "due_date": "finish"}).copy()
-    task_source["record_type"] = task_source["task_type"]
-    gantt = pd.concat([source[["name", "start", "finish", "status", "progress", "record_type"]], task_source[["name", "start", "finish", "status", "progress", "record_type"]]], ignore_index=True)
+    if not schedules.empty:
+        gantt = schedules.rename(columns={"activity_name": "name", "planned_start": "start", "planned_finish": "finish"}).copy()
+        gantt["record_type"] = "Schedule"
+    else:
+        gantt = tasks.rename(columns={"task_name": "name", "start_date": "start", "due_date": "finish"}).copy()
+        gantt["record_type"] = gantt["task_type"]
+    gantt = gantt[["name", "start", "finish", "status", "progress", "record_type"]].copy()
+    gantt["start"] = pd.to_datetime(gantt["start"], errors="coerce")
+    gantt["finish"] = pd.to_datetime(gantt["finish"], errors="coerce")
+    gantt = gantt.dropna(subset=["name", "start", "finish"])
+    if gantt.empty:
+        st.info("No schedule records have valid start and finish dates yet.")
+        return
+    min_start = gantt["start"].min() - pd.Timedelta(days=14)
+    max_finish = gantt["finish"].max() + pd.Timedelta(days=30)
+    chart_height = max(520, min(1100, 140 + len(gantt) * 28))
     fig = px.timeline(gantt, x_start="start", x_end="finish", y="name", color="status", color_discrete_map=STATUS_COLORS, hover_data=["progress", "record_type"], title="Baseline / Actual Schedule Gantt")
     fig.update_yaxes(autorange="reversed")
-    fig.update_layout(margin=dict(t=45, l=10, r=10, b=10), yaxis_title="")
-    st.plotly_chart(fig, use_container_width=True)
+    fig.update_layout(
+        margin=dict(t=55, l=10, r=80, b=35),
+        yaxis_title="",
+        height=chart_height,
+        xaxis_range=[min_start, max_finish],
+    )
+    st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
     show_table(schedules, ["activity_name", "planned_start", "planned_finish", "baseline_start", "baseline_finish", "actual_start", "actual_finish", "delay_days", "progress", "status", "remarks"], 300)
 
 
