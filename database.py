@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 import json
+import os
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -85,6 +86,9 @@ def init_db(seed: bool = True) -> None:
     with get_connection() as conn:
         conn.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
         migrate_existing_database(conn)
+        if seed and should_force_resource_seed(conn):
+            clear_dashboard_tables(conn)
+            seed_from_resource_file(conn)
         if seed and is_empty(conn, "projects"):
             if not seed_from_resource_file(conn):
                 seed_sample_data(conn)
@@ -282,26 +286,62 @@ def execute_many(sql: str, rows: list[tuple]) -> None:
         conn.executemany(sql, rows)
 
 
+RESOURCE_TABLES = [
+    "projects",
+    "tasks",
+    "team_members",
+    "schedules",
+    "risk_logs",
+    "issues",
+    "budget_items",
+    "milestones",
+    "authority_submissions",
+    "documents",
+    "meetings",
+    "email_settings",
+    "email_notifications",
+]
+
+
+def should_force_resource_seed(conn: sqlite3.Connection) -> bool:
+    if not RESOURCE_SEED_PATH.exists():
+        return False
+    if os.name == "nt" and os.environ.get("FORCE_RESOURCE_SEED") != "1":
+        return False
+    payload = json.loads(RESOURCE_SEED_PATH.read_text(encoding="utf-8"))
+    for table in ["projects", "tasks", "schedules"]:
+        expected = len(payload.get(table, []))
+        actual = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        if actual != expected:
+            return True
+    expected_projects = [row.get("project_name") for row in payload.get("projects", [])]
+    actual_projects = [
+        row["project_name"]
+        for row in conn.execute("SELECT project_name FROM projects ORDER BY id").fetchall()
+    ]
+    if actual_projects != expected_projects:
+        return True
+    return False
+
+
+def clear_dashboard_tables(conn: sqlite3.Connection) -> None:
+    conn.execute("PRAGMA foreign_keys = OFF")
+    for table in reversed(RESOURCE_TABLES):
+        conn.execute(f"DELETE FROM {table}")
+    conn.execute(
+        "DELETE FROM sqlite_sequence WHERE name IN ({})".format(
+            ", ".join(["?"] * len(RESOURCE_TABLES))
+        ),
+        RESOURCE_TABLES,
+    )
+    conn.execute("PRAGMA foreign_keys = ON")
+
+
 def seed_from_resource_file(conn: sqlite3.Connection) -> bool:
     if not RESOURCE_SEED_PATH.exists():
         return False
     payload = json.loads(RESOURCE_SEED_PATH.read_text(encoding="utf-8"))
-    tables = [
-        "projects",
-        "tasks",
-        "team_members",
-        "schedules",
-        "risk_logs",
-        "issues",
-        "budget_items",
-        "milestones",
-        "authority_submissions",
-        "documents",
-        "meetings",
-        "email_settings",
-        "email_notifications",
-    ]
-    for table in tables:
+    for table in RESOURCE_TABLES:
         rows = payload.get(table, [])
         if not rows:
             continue
