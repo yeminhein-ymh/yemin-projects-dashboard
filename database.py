@@ -83,6 +83,11 @@ def get_connection():
 
 def init_db(seed: bool = True) -> None:
     ensure_directories()
+    if seed and os.name != "nt" and not RESOURCE_SEED_PATH.exists():
+        raise RuntimeError(
+            "resources/dashboard_seed.json is missing. Upload the full resources/ folder to GitHub "
+            "so Streamlit Cloud can match the local dashboard data."
+        )
     with get_connection() as conn:
         conn.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
         migrate_existing_database(conn)
