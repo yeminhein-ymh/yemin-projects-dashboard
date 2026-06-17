@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+import json
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -14,6 +15,7 @@ DATA_DIR = BASE_DIR / "data"
 UPLOAD_DIR = BASE_DIR / "uploads"
 DB_PATH = DATA_DIR / "project_management.db"
 SCHEMA_PATH = BASE_DIR / "schema.sql"
+RESOURCE_SEED_PATH = BASE_DIR / "resources" / "dashboard_seed.json"
 
 
 STATUS_TYPES = ["Not Started", "In Progress", "Done", "At Risk", "Delayed", "Closed"]
@@ -84,7 +86,8 @@ def init_db(seed: bool = True) -> None:
         conn.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
         migrate_existing_database(conn)
         if seed and is_empty(conn, "projects"):
-            seed_sample_data(conn)
+            if not seed_from_resource_file(conn):
+                seed_sample_data(conn)
         elif seed:
             enrich_existing_database(conn)
         recalculate_all_project_progress(conn)
@@ -277,6 +280,41 @@ def execute(sql: str, params: Iterable | None = None) -> int:
 def execute_many(sql: str, rows: list[tuple]) -> None:
     with get_connection() as conn:
         conn.executemany(sql, rows)
+
+
+def seed_from_resource_file(conn: sqlite3.Connection) -> bool:
+    if not RESOURCE_SEED_PATH.exists():
+        return False
+    payload = json.loads(RESOURCE_SEED_PATH.read_text(encoding="utf-8"))
+    tables = [
+        "projects",
+        "tasks",
+        "team_members",
+        "schedules",
+        "risk_logs",
+        "issues",
+        "budget_items",
+        "milestones",
+        "authority_submissions",
+        "documents",
+        "meetings",
+        "email_settings",
+        "email_notifications",
+    ]
+    for table in tables:
+        rows = payload.get(table, [])
+        if not rows:
+            continue
+        valid_columns = [row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()]
+        for row in rows:
+            clean = {key: row.get(key) for key in valid_columns if key in row}
+            columns = list(clean.keys())
+            placeholders = ", ".join(["?"] * len(columns))
+            conn.execute(
+                f"INSERT INTO {table} ({', '.join(columns)}) VALUES ({placeholders})",
+                tuple(clean[column] for column in columns),
+            )
+    return True
 
 
 ALLOWED_UPDATE_COLUMNS = {
