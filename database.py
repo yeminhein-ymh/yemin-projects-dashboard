@@ -19,6 +19,20 @@ SCHEMA_PATH = BASE_DIR / "schema.sql"
 STATUS_TYPES = ["Not Started", "In Progress", "Done", "At Risk", "Delayed", "Closed"]
 USER_ROLES = ["Admin", "Project Director", "Project Manager", "Engineer", "Contractor", "Client Viewer"]
 
+PV_SCHEDULE_TEMPLATE = [
+    ("Site survey and pre-com report", 3),
+    ("Drawing submission and approval", 14),
+    ("Submit safety documents and approval", 14),
+    ("SCDF (MAA) Submission", 14),
+    ("Install Cat Ladder and Lifeline", 14),
+    ("Materials Purchasing and Arrival", 30),
+    ("Mobilisation & Site preparation", 7),
+    ("Structure and Panel Installation", 30),
+    ("Electrical Installation works", 21),
+    ("Electrical shut down", 1),
+    ("PV system Turn on", 1),
+]
+
 
 PROJECT_DEFAULTS = {
     "project_director": "Portfolio Director",
@@ -451,6 +465,48 @@ def sync_task_from_schedule(project_id: int, old_activity_name: str, fields: dic
                 ),
             )
         update_project_progress(conn, project_id)
+
+
+def apply_project_schedule_template(project_id: int, replace: bool = False) -> int:
+    with get_connection() as conn:
+        project = conn.execute(
+            "SELECT start_date FROM projects WHERE id = ?",
+            (project_id,),
+        ).fetchone()
+        if project is None:
+            raise ValueError(f"Project not found: {project_id}")
+        start = pd_date(project["start_date"])
+        if replace:
+            conn.execute("DELETE FROM schedules WHERE project_id = ?", (project_id,))
+        existing_names = {
+            str(row["activity_name"]).strip().lower()
+            for row in conn.execute("SELECT activity_name FROM schedules WHERE project_id = ?", (project_id,)).fetchall()
+        }
+        cursor_date = start
+        inserted = 0
+        for activity_name, duration_days in PV_SCHEDULE_TEMPLATE:
+            finish = cursor_date + timedelta(days=max(duration_days - 1, 0))
+            if activity_name.strip().lower() not in existing_names:
+                conn.execute(
+                    """
+                    INSERT INTO schedules (
+                        project_id, activity_name, planned_start, planned_finish, baseline_start,
+                        baseline_finish, actual_start, actual_finish, delay_days, progress, status, remarks
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, 0, 0, 'Not Started', '')
+                    """,
+                    (
+                        project_id,
+                        activity_name,
+                        cursor_date.isoformat(),
+                        finish.isoformat(),
+                        cursor_date.isoformat(),
+                        finish.isoformat(),
+                    ),
+                )
+                inserted += 1
+            cursor_date = finish + timedelta(days=1)
+        return inserted
 
 
 def delete_task_for_schedule(project_id: int, activity_name: str) -> None:

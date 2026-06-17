@@ -494,11 +494,12 @@ def project_workspace(data: dict[str, pd.DataFrame]) -> None:
         unsafe_allow_html=True,
     )
     tasks = data["tasks"][data["tasks"]["project_id"] == project_id]
-    created_schedule_rows = db.ensure_schedules_for_major_tasks(project_id)
-    if created_schedule_rows:
-        st.toast(f"Created {created_schedule_rows} schedule row(s) from Major tasks.")
-        refresh()
     schedules = data["schedules"][data["schedules"]["project_id"] == project_id]
+    if schedules.empty:
+        created_schedule_rows = db.apply_project_schedule_template(project_id, replace=False)
+        if created_schedule_rows:
+            st.toast(f"Created {created_schedule_rows} schedule row(s) from the PV schedule template.")
+            refresh()
     risks = data["risks"][data["risks"]["project_id"] == project_id]
     issues = data["issues"][data["issues"]["project_id"] == project_id]
     budget = data["budget"][data["budget"]["project_id"] == project_id]
@@ -526,6 +527,7 @@ def project_workspace(data: dict[str, pd.DataFrame]) -> None:
             edit_milestone_form(milestones)
             show_table(milestones, ["milestone_name", "owner", "due_date", "baseline_date", "actual_date", "status"], 260)
     with tabs[1]:
+        schedule_template_controls(project_id)
         schedule_spreadsheet_editor(project_id, schedules)
         show_gantt(schedules, tasks)
     with tabs[2]:
@@ -564,16 +566,30 @@ def project_workspace(data: dict[str, pd.DataFrame]) -> None:
         show_table(team, ["name", "role", "user_role", "email", "phone", "capacity_hours", "allocated_hours"], 350)
 
 
+def schedule_template_controls(project_id: int) -> None:
+    with st.expander("PV schedule template", expanded=False):
+        st.caption("Template starts from the project start date and follows the standard PV schedule sequence.")
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button("Add Missing Template Rows", type="primary", key=f"add_template_{project_id}"):
+                inserted = db.apply_project_schedule_template(project_id, replace=False)
+                st.success(f"Added {inserted} missing schedule row(s).")
+                refresh()
+        with c2:
+            confirm_reset = st.checkbox("Replace current schedule", key=f"replace_schedule_confirm_{project_id}")
+            if st.button("Reset From Project Start Date", disabled=not confirm_reset, key=f"reset_template_{project_id}"):
+                inserted = db.apply_project_schedule_template(project_id, replace=True)
+                st.success(f"Reset schedule with {inserted} template row(s).")
+                refresh()
+
+
 def show_gantt(schedules: pd.DataFrame, tasks: pd.DataFrame) -> None:
-    if schedules.empty and tasks.empty:
+    if schedules.empty:
         st.info("No schedule or task records yet.")
         return
-    if not schedules.empty:
-        gantt = schedules.rename(columns={"activity_name": "name", "planned_start": "start", "planned_finish": "finish"}).copy()
-        gantt["record_type"] = "Schedule"
-    else:
-        gantt = tasks.rename(columns={"task_name": "name", "start_date": "start", "due_date": "finish"}).copy()
-        gantt["record_type"] = gantt["task_type"]
+    show_schedule_matrix(schedules)
+    gantt = schedules.rename(columns={"activity_name": "name", "planned_start": "start", "planned_finish": "finish"}).copy()
+    gantt["record_type"] = "Schedule"
     gantt = gantt[["name", "start", "finish", "status", "progress", "record_type"]].copy()
     gantt["start"] = pd.to_datetime(gantt["start"], errors="coerce")
     gantt["finish"] = pd.to_datetime(gantt["finish"], errors="coerce")
@@ -594,6 +610,46 @@ def show_gantt(schedules: pd.DataFrame, tasks: pd.DataFrame) -> None:
     )
     st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
     show_table(schedules, ["activity_name", "planned_start", "planned_finish", "baseline_start", "baseline_finish", "actual_start", "actual_finish", "delay_days", "progress", "status", "remarks"], 300)
+
+
+def show_schedule_matrix(schedules: pd.DataFrame) -> None:
+    frame = schedules.copy()
+    frame["planned_start_dt"] = pd.to_datetime(frame["planned_start"], errors="coerce")
+    frame["planned_finish_dt"] = pd.to_datetime(frame["planned_finish"], errors="coerce")
+    frame = frame.dropna(subset=["activity_name", "planned_start_dt", "planned_finish_dt"])
+    if frame.empty:
+        return
+    start_anchor = frame["planned_start_dt"].min()
+    end_anchor = frame["planned_finish_dt"].max()
+    week_count = max(12, min(52, int(((end_anchor - start_anchor).days // 7) + 2)))
+    rows = []
+    for item in frame.itertuples():
+        duration_days = max((item.planned_finish_dt - item.planned_start_dt).days + 1, 1)
+        row = {
+            "Activity": item.activity_name,
+            "Duration Weeks": max(1, int((duration_days + 6) // 7)),
+            "_status": item.status,
+        }
+        for week in range(1, week_count + 1):
+            week_start = start_anchor + pd.Timedelta(days=(week - 1) * 7)
+            week_finish = week_start + pd.Timedelta(days=6)
+            row[f"Week {week}"] = " " if item.planned_start_dt <= week_finish and item.planned_finish_dt >= week_start else ""
+        rows.append(row)
+    matrix = pd.DataFrame(rows)
+
+    def style_schedule(value: object) -> str:
+        if value == " ":
+            return "background-color: #bfe3f2; border: 1px solid #9fb6c3;"
+        return "border: 1px solid #d1d5db;"
+
+    display = matrix.drop(columns=["_status"])
+    week_cols = [col for col in display.columns if col.startswith("Week ")]
+    styled = display.style.map(style_schedule, subset=week_cols).set_properties(
+        subset=["Activity", "Duration Weeks"],
+        **{"border": "1px solid #d1d5db", "font-weight": "600"},
+    )
+    st.markdown('<div class="small-title">Project Schedule Matrix</div>', unsafe_allow_html=True)
+    st.dataframe(styled, use_container_width=True, hide_index=True, height=min(680, 120 + len(display) * 36))
 
 
 def schedule_spreadsheet_editor(project_id: int, schedules: pd.DataFrame) -> None:
@@ -639,21 +695,16 @@ def schedule_spreadsheet_editor(project_id: int, schedules: pd.DataFrame) -> Non
             & edited["activity_name"].apply(lambda value: bool(clean_text(value)))
         ] if "id" in edited.columns and "activity_name" in edited.columns else pd.DataFrame()
         if not unsaved_rows.empty:
-            st.warning(f"{len(unsaved_rows)} new schedule row(s) are not saved yet. Click Save Schedule Table to update Tasks and Major Tasks.")
+            st.warning(f"{len(unsaved_rows)} new schedule row(s) are not saved yet. Click Save Schedule Table.")
 
         if st.button("Save Schedule Table", type="primary", key=f"save_schedule_sheet_{project_id}"):
             changed = 0
             skipped = 0
-            schedule_by_id = {int(row.id): row for row in schedules.itertuples()} if not schedules.empty else {}
             for _, row in edited.iterrows():
                 record_id = row.get("id")
                 has_id = not pd.isna(record_id) if record_id is not None else False
-                old_activity_name = ""
-                if has_id and int(record_id) in schedule_by_id:
-                    old_activity_name = str(getattr(schedule_by_id[int(record_id)], "activity_name", "") or "")
                 if clean_bool(row.get("_delete")) and has_id:
                     db.delete_record("schedules", int(record_id))
-                    db.delete_task_for_schedule(project_id, old_activity_name)
                     changed += 1
                     continue
 
@@ -682,10 +733,8 @@ def schedule_spreadsheet_editor(project_id: int, schedules: pd.DataFrame) -> Non
                     db.update_record("schedules", int(record_id), fields)
                 else:
                     db.insert_record("schedules", project_id, fields)
-                    old_activity_name = activity_name
-                db.sync_task_from_schedule(project_id, old_activity_name, fields)
                 changed += 1
-            st.success(f"Saved {changed} schedule change(s) and synced matching task rows.")
+            st.success(f"Saved {changed} schedule change(s).")
             if skipped:
                 st.warning(f"Skipped {skipped} row(s) without activity names.")
             refresh()
@@ -720,7 +769,7 @@ def project_setup(data: dict[str, pd.DataFrame]) -> None:
         else:
             project_id = db.add_project(project_name, client_name, manager, start, target, status, progress, director, portfolio, template, priority, budget)
             db.add_team_member(project_id, manager, "Project Manager", "", "", "Project Manager", 40, 32)
-            db.add_schedule(project_id, "Overall baseline schedule", start, target, None, None, progress, status, "Created from project template.")
+            db.apply_project_schedule_template(project_id, replace=True)
             db.add_milestone(project_id, "Project completion", target, status, manager)
             st.success(f"Created project: {project_name}")
             refresh()
@@ -874,14 +923,10 @@ def task_spreadsheet_editor(
             skipped = 0
             last_task_type = default_task_type
             last_owner = default_owner
-            task_by_id = {int(row.id): row for row in tasks.itertuples()} if not tasks.empty else {}
             for _, row in edited.iterrows():
                 record_id = row.get("id")
                 has_id = not pd.isna(record_id) if record_id is not None else False
                 if clean_bool(row.get("_delete")) and has_id:
-                    old_task = task_by_id.get(int(record_id))
-                    if old_task and str(getattr(old_task, "task_type", "")) == "Major":
-                        db.delete_schedule_for_task(project_id, str(getattr(old_task, "task_name", "") or ""))
                     db.delete_record("tasks", int(record_id))
                     changed += 1
                     continue
@@ -911,18 +956,9 @@ def task_spreadsheet_editor(
                     skipped += 1
                     continue
                 if has_id:
-                    old_task = task_by_id.get(int(record_id))
-                    old_task_name = str(getattr(old_task, "task_name", fields["task_name"]) or fields["task_name"]) if old_task else fields["task_name"]
-                    old_task_type = str(getattr(old_task, "task_type", "") or "") if old_task else ""
                     db.update_record("tasks", int(record_id), fields)
-                    if fields["task_type"] == "Major":
-                        db.sync_schedule_from_task(project_id, old_task_name, fields)
-                    elif old_task_type == "Major":
-                        db.delete_schedule_for_task(project_id, old_task_name)
                 else:
                     db.insert_record("tasks", project_id, fields)
-                    if fields["task_type"] == "Major":
-                        db.sync_schedule_from_task(project_id, fields["task_name"], fields)
                 changed += 1
             st.success(f"Saved {changed} task change(s).")
             if skipped:
