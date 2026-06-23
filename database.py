@@ -86,9 +86,8 @@ def init_db(seed: bool = True) -> None:
     with get_connection() as conn:
         conn.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
         migrate_existing_database(conn)
-        if seed and should_force_resource_seed(conn):
-            clear_dashboard_tables(conn)
-            seed_from_resource_file(conn)
+        # Seed data is only for first run. Once users edit/save records,
+        # startup must preserve the database instead of restoring resources.
         if seed and is_empty(conn, "projects"):
             if not seed_from_resource_file(conn):
                 seed_sample_data(conn)
