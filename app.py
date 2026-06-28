@@ -1515,7 +1515,7 @@ def edit_team_form(team: pd.DataFrame) -> None:
 
 
 def solar_pv_module(data: dict[str, pd.DataFrame]) -> None:
-    st.title("Solar PV Control Module")
+    st.title("Authority Submission Status")
     st.caption("Authority, SP, LEW, QP, engineering, construction, and commissioning tracker.")
     authority = data["authority"]
     solar_projects = data["projects"][data["projects"]["portfolio"].str.contains("Solar", case=False, na=False)]
@@ -1845,7 +1845,7 @@ def main() -> None:
                 "Main Dashboard",
                 "Project Management",
                 "Project Workspace",
-                "Solar PV Module",
+                "Authority Submission Status",
                 "Reports",
                 "Documents",
                 "Notifications",
@@ -1861,7 +1861,7 @@ def main() -> None:
         project_setup(filtered)
     elif page == "Project Workspace":
         project_workspace(filtered)
-    elif page == "Solar PV Module":
+    elif page == "Authority Submission Status":
         solar_pv_module(filtered)
     elif page == "Reports":
         reports_center(filtered)
