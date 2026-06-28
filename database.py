@@ -3,6 +3,7 @@ from __future__ import annotations
 import sqlite3
 import json
 import os
+import re
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -17,6 +18,22 @@ UPLOAD_DIR = BASE_DIR / "uploads"
 DB_PATH = DATA_DIR / "project_management.db"
 SCHEMA_PATH = BASE_DIR / "schema.sql"
 RESOURCE_SEED_PATH = BASE_DIR / "resources" / "dashboard_seed.json"
+
+
+def database_url() -> str:
+    url = os.environ.get("DATABASE_URL", "").strip()
+    if url:
+        return url
+    try:
+        import streamlit as st
+
+        return str(st.secrets.get("DATABASE_URL", "")).strip()
+    except Exception:
+        return ""
+
+
+def using_postgres() -> bool:
+    return bool(database_url())
 
 
 STATUS_TYPES = ["Not Started", "In Progress", "Done", "At Risk", "Delayed", "Closed"]
@@ -71,14 +88,94 @@ def ensure_directories() -> None:
 @contextmanager
 def get_connection():
     ensure_directories()
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
+    conn = connect_database()
     try:
         yield conn
         conn.commit()
     finally:
         conn.close()
+
+
+def connect_database():
+    if using_postgres():
+        try:
+            import psycopg
+            from psycopg.rows import dict_row
+        except ImportError as exc:
+            raise RuntimeError(
+                "PostgreSQL permanent saving is enabled, but psycopg is not installed. "
+                "Upload the updated requirements.txt and reboot Streamlit Cloud."
+            ) from exc
+
+        raw = psycopg.connect(database_url(), row_factory=dict_row)
+        return PostgresConnection(raw)
+
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    return conn
+
+
+class DbCursor:
+    def __init__(self, cursor, lastrowid: int | None = None):
+        self._cursor = cursor
+        self.lastrowid = lastrowid
+
+    def fetchone(self):
+        return self._cursor.fetchone()
+
+    def fetchall(self):
+        return self._cursor.fetchall()
+
+
+class PostgresConnection:
+    def __init__(self, raw):
+        self.raw = raw
+
+    def execute(self, sql: str, params: Iterable | None = None):
+        converted = postgres_sql(sql)
+        values = tuple(params or [])
+        returning_id = should_return_insert_id(converted)
+        if returning_id:
+            converted = converted.rstrip().rstrip(";") + " RETURNING id"
+        cur = self.raw.execute(converted, values)
+        lastrowid = None
+        if returning_id:
+            row = cur.fetchone()
+            lastrowid = int(row["id"] if isinstance(row, dict) else row[0])
+        return DbCursor(cur, lastrowid)
+
+    def executemany(self, sql: str, rows: list[tuple]) -> None:
+        converted = postgres_sql(sql)
+        with self.raw.cursor() as cur:
+            cur.executemany(converted, rows)
+
+    def executescript(self, script: str) -> None:
+        for statement in postgres_schema(script).split(";"):
+            statement = statement.strip()
+            if statement:
+                self.raw.execute(statement)
+
+    def commit(self) -> None:
+        self.raw.commit()
+
+    def close(self) -> None:
+        self.raw.close()
+
+
+def postgres_sql(sql: str) -> str:
+    return sql.replace("?", "%s")
+
+
+def postgres_schema(script: str) -> str:
+    converted = script.replace("INTEGER PRIMARY KEY AUTOINCREMENT", "SERIAL PRIMARY KEY")
+    converted = re.sub(r"\bREAL\b", "DOUBLE PRECISION", converted)
+    return converted
+
+
+def should_return_insert_id(sql: str) -> bool:
+    normalized = sql.lstrip().upper()
+    return normalized.startswith("INSERT INTO ") and " RETURNING " not in normalized
 
 
 def init_db(seed: bool = True) -> None:
@@ -97,6 +194,8 @@ def init_db(seed: bool = True) -> None:
 
 
 def migrate_existing_database(conn: sqlite3.Connection) -> None:
+    if using_postgres():
+        return
     rebuild_legacy_status_tables(conn)
     for table, defaults in {
         "projects": PROJECT_DEFAULTS,
@@ -250,7 +349,7 @@ def sync_project_financials(conn: sqlite3.Connection) -> None:
 
 
 def add_missing_columns(conn: sqlite3.Connection, table: str, defaults: dict[str, object]) -> None:
-    existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+    existing = set(table_columns(conn, table))
     for column, default in defaults.items():
         if column in existing:
             continue
@@ -266,11 +365,18 @@ def sql_literal(value: object) -> str:
 
 
 def is_empty(conn: sqlite3.Connection, table: str) -> bool:
-    return conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0
+    return scalar(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()) == 0
 
 
 def query_df(sql: str, params: Iterable | None = None) -> pd.DataFrame:
     with get_connection() as conn:
+        if using_postgres():
+            cur = conn.execute(sql, params or [])
+            rows = cur.fetchall()
+            if rows:
+                return pd.DataFrame(rows)
+            columns = [desc[0] for desc in cur._cursor.description] if cur._cursor.description else []
+            return pd.DataFrame(columns=columns)
         return pd.read_sql_query(sql, conn, params=params or [])
 
 
@@ -283,6 +389,27 @@ def execute(sql: str, params: Iterable | None = None) -> int:
 def execute_many(sql: str, rows: list[tuple]) -> None:
     with get_connection() as conn:
         conn.executemany(sql, rows)
+
+
+def scalar(row) -> object:
+    if isinstance(row, dict):
+        return next(iter(row.values()))
+    return row[0]
+
+
+def table_columns(conn, table: str) -> list[str]:
+    if using_postgres():
+        rows = conn.execute(
+            """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = 'public' AND table_name = ?
+            ORDER BY ordinal_position
+            """,
+            (table,),
+        ).fetchall()
+        return [row["column_name"] for row in rows]
+    return [row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()]
 
 
 RESOURCE_TABLES = [
@@ -310,7 +437,7 @@ def should_force_resource_seed(conn: sqlite3.Connection) -> bool:
     payload = json.loads(RESOURCE_SEED_PATH.read_text(encoding="utf-8"))
     for table in ["projects", "tasks", "schedules"]:
         expected = len(payload.get(table, []))
-        actual = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        actual = scalar(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone())
         if actual != expected:
             return True
     expected_projects = [row.get("project_name") for row in payload.get("projects", [])]
@@ -344,7 +471,7 @@ def seed_from_resource_file(conn: sqlite3.Connection) -> bool:
         rows = payload.get(table, [])
         if not rows:
             continue
-        valid_columns = [row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()]
+        valid_columns = table_columns(conn, table)
         for row in rows:
             clean = {key: row.get(key) for key in valid_columns if key in row}
             columns = list(clean.keys())
@@ -353,7 +480,24 @@ def seed_from_resource_file(conn: sqlite3.Connection) -> bool:
                 f"INSERT INTO {table} ({', '.join(columns)}) VALUES ({placeholders})",
                 tuple(clean[column] for column in columns),
             )
+    sync_postgres_sequences(conn)
     return True
+
+
+def sync_postgres_sequences(conn) -> None:
+    if not using_postgres():
+        return
+    for table in RESOURCE_TABLES:
+        conn.execute(
+            """
+            SELECT setval(
+                pg_get_serial_sequence(?, 'id'),
+                COALESCE((SELECT MAX(id) FROM {table}), 1),
+                COALESCE((SELECT MAX(id) FROM {table}), 0) > 0
+            )
+            """.format(table=table),
+            (table,),
+        )
 
 
 ALLOWED_UPDATE_COLUMNS = {

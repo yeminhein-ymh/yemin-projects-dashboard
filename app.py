@@ -1794,13 +1794,17 @@ def build_notification_body(tasks: pd.DataFrame) -> str:
 
 def database_admin(data: dict[str, pd.DataFrame]) -> None:
     st.title("Database & Admin")
-    st.caption(f"SQLite database: {db.DB_PATH}")
-    st.warning(
-        "This app currently saves edits to a local SQLite file. On Streamlit Cloud, "
-        "that file can be reset when the app restarts, redeploys, or the cloud container "
-        "is recreated. For permanent cloud saving, connect the app to PostgreSQL/Supabase/Neon."
-    )
-    if db.DB_PATH.exists():
+    if db.using_postgres():
+        st.caption("Database: PostgreSQL permanent cloud database")
+        st.success("Permanent saving is enabled. Project, task, major task, schedule, budget, risk, issue, and team changes are saved to PostgreSQL.")
+    else:
+        st.caption(f"SQLite database: {db.DB_PATH}")
+        st.warning(
+            "This app currently saves edits to a local SQLite file. On Streamlit Cloud, "
+            "that file can be reset when the app restarts, redeploys, or the cloud container "
+            "is recreated. For permanent cloud saving, add DATABASE_URL in Streamlit Secrets."
+        )
+    if not db.using_postgres() and db.DB_PATH.exists():
         st.download_button(
             "Download SQLite Backup",
             db.DB_PATH.read_bytes(),
