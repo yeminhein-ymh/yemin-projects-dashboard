@@ -1795,6 +1795,18 @@ def build_notification_body(tasks: pd.DataFrame) -> str:
 def database_admin(data: dict[str, pd.DataFrame]) -> None:
     st.title("Database & Admin")
     st.caption(f"SQLite database: {db.DB_PATH}")
+    st.warning(
+        "This app currently saves edits to a local SQLite file. On Streamlit Cloud, "
+        "that file can be reset when the app restarts, redeploys, or the cloud container "
+        "is recreated. For permanent cloud saving, connect the app to PostgreSQL/Supabase/Neon."
+    )
+    if db.DB_PATH.exists():
+        st.download_button(
+            "Download SQLite Backup",
+            db.DB_PATH.read_bytes(),
+            file_name="project_management_backup.db",
+            mime="application/octet-stream",
+        )
     selected = st.selectbox("Table", list(data.keys()))
     show_table(data[selected], height=520)
     if st.button("Reload Database"):
