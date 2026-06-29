@@ -371,14 +371,17 @@ def prepare_editor_frame(frame: pd.DataFrame, columns: list[str]) -> pd.DataFram
     else:
         editor = frame.copy()
         editor["_delete"] = False
-        editor = editor[["_delete", "id", *[col for col in columns if col in editor.columns]]]
+        for col in ["id", *columns]:
+            if col not in editor.columns:
+                editor[col] = None
+        editor = editor[["_delete", "id", *columns]]
     return editor
 
 
 def editor_common_config() -> dict:
     return {
         "_delete": st.column_config.CheckboxColumn("Delete"),
-        "id": None,
+        "id": st.column_config.NumberColumn("ID", disabled=True, width="small"),
     }
 
 
