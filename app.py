@@ -182,7 +182,13 @@ def show_table(frame: pd.DataFrame, columns: list[str] | None = None, height: in
         st.dataframe(view, use_container_width=True, hide_index=True, height=height)
 
 
-@st.cache_data(ttl=5)
+@st.cache_resource
+def initialize_database() -> bool:
+    db.init_db(seed=True)
+    return True
+
+
+@st.cache_data(ttl=60)
 def load_data() -> dict[str, pd.DataFrame]:
     return {
         "projects": db.query_df("SELECT * FROM projects ORDER BY target_completion_date"),
@@ -1800,6 +1806,7 @@ def database_admin(data: dict[str, pd.DataFrame]) -> None:
     if db.using_postgres():
         st.caption("Database: PostgreSQL permanent cloud database")
         st.success("Permanent saving is enabled. Project, task, major task, schedule, budget, risk, issue, and team changes are saved to PostgreSQL.")
+        st.info("For best speed, use a database region close to Streamlit Cloud and avoid free-tier databases that sleep after inactivity.")
     else:
         st.caption(f"SQLite database: {db.DB_PATH}")
         st.warning(
@@ -1831,7 +1838,7 @@ def main() -> None:
     apply_styles(theme)
 
     try:
-        db.init_db(seed=True)
+        initialize_database()
         data = load_data()
     except Exception as exc:
         st.error("The app started, but the project database could not be initialized.")

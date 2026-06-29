@@ -7,6 +7,7 @@ import re
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from queue import Empty, Queue
 from typing import Iterable
 
 import pandas as pd
@@ -34,6 +35,9 @@ def database_url() -> str:
 
 def using_postgres() -> bool:
     return bool(database_url())
+
+
+_PG_POOL: Queue | None = None
 
 
 STATUS_TYPES = ["Not Started", "In Progress", "Done", "At Risk", "Delayed", "Closed"]
@@ -93,27 +97,63 @@ def get_connection():
         yield conn
         conn.commit()
     finally:
-        conn.close()
+        release_connection(conn)
 
 
 def connect_database():
     if using_postgres():
-        try:
-            import psycopg
-            from psycopg.rows import dict_row
-        except ImportError as exc:
-            raise RuntimeError(
-                "PostgreSQL permanent saving is enabled, but psycopg is not installed. "
-                "Upload the updated requirements.txt and reboot Streamlit Cloud."
-            ) from exc
-
-        raw = psycopg.connect(database_url(), row_factory=dict_row)
-        return PostgresConnection(raw)
+        return get_postgres_connection()
 
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     return conn
+
+
+def get_postgres_connection():
+    global _PG_POOL
+    if _PG_POOL is None:
+        _PG_POOL = Queue(maxsize=5)
+
+    try:
+        conn = _PG_POOL.get_nowait()
+        conn.raw.execute("SELECT 1")
+        return conn
+    except Empty:
+        return open_postgres_connection()
+    except Exception:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        return open_postgres_connection()
+
+
+def open_postgres_connection():
+    try:
+        import psycopg
+        from psycopg.rows import dict_row
+    except ImportError as exc:
+        raise RuntimeError(
+            "PostgreSQL permanent saving is enabled, but psycopg is not installed. "
+            "Upload the updated requirements.txt and reboot Streamlit Cloud."
+        ) from exc
+
+    raw = psycopg.connect(database_url(), row_factory=dict_row, connect_timeout=10)
+    raw.execute("SET statement_timeout = '15s'")
+    return PostgresConnection(raw)
+
+
+def release_connection(conn) -> None:
+    if using_postgres() and isinstance(conn, PostgresConnection):
+        global _PG_POOL
+        if _PG_POOL is not None:
+            try:
+                _PG_POOL.put_nowait(conn)
+                return
+            except Exception:
+                pass
+    conn.close()
 
 
 class DbCursor:
@@ -190,7 +230,6 @@ def init_db(seed: bool = True) -> None:
                 seed_sample_data(conn)
         elif seed:
             enrich_existing_database(conn)
-        recalculate_all_project_progress(conn)
 
 
 def migrate_existing_database(conn: sqlite3.Connection) -> None:
